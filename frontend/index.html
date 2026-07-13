@@ -1901,7 +1901,7 @@
 
   <div class="drawer-layer" id="drawer-layer" aria-hidden="true">
     <button class="drawer-dismiss" id="drawer-dismiss" type="button" tabindex="-1" aria-label="关闭命令编辑"></button>
-    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" data-od-id="command-drawer">
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" tabindex="-1" data-od-id="command-drawer">
       <header class="drawer-header">
         <div>
           <h2 id="drawer-title">添加命令</h2>
@@ -1952,7 +1952,7 @@
 
   <div class="repository-dialog-layer" id="repository-dialog-layer" aria-hidden="true">
     <button class="repository-dialog-dismiss" id="repository-dialog-dismiss" type="button" tabindex="-1" aria-label="关闭数据仓库设置"></button>
-    <section class="repository-dialog" role="dialog" aria-modal="true" aria-labelledby="repository-dialog-title">
+    <section class="repository-dialog" role="dialog" aria-modal="true" aria-labelledby="repository-dialog-title" tabindex="-1">
       <form id="repository-form" novalidate>
         <h2 id="repository-dialog-title">数据仓库</h2>
         <p class="repository-dialog-description">选择已经克隆到本机的个人 Git 仓库。CommandShelf 只读写其中的 commands.json，不管理 GitHub 账号。</p>
@@ -2105,6 +2105,12 @@
     let editingCommandId = null;
     let draggedCommandId = null;
     let toastTimer = null;
+    /** 命令抽屉关闭后优先恢复的触发控件；控件被重绘时改用命令 ID 查找语义等价按钮。 */
+    let drawerReturnFocusTarget = null;
+    /** 编辑抽屉对应的命令 ID；新增模式为空，用于列表重绘后重新定位编辑按钮。 */
+    let drawerReturnCommandId = null;
+    /** 仓库对话框关闭后恢复的触发控件，支持从仓库名或同步操作入口打开。 */
+    let repositoryReturnFocusTarget = null;
     const expandedCommandIds = new Set(["linux-1"]);
 
     /**
@@ -2159,6 +2165,85 @@
     const repositoryError = document.getElementById("repository-error");
     const toast = document.getElementById("toast");
     const toastMessage = toast.querySelector("span");
+
+    /**
+     * 浮层内可通过 Tab 到达的常见控件选择器；禁用和显式移出 Tab 顺序的节点由选择器直接排除。
+     * @type {string}
+     */
+    const focusableControlSelector = [
+      "a[href]",
+      "button:not([disabled])",
+      "input:not([disabled]):not([type='hidden'])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "[contenteditable='true']",
+      "[tabindex]:not([tabindex='-1'])"
+    ].join(",");
+
+    /**
+     * 判断节点是否仍可安全接收焦点，避免把焦点交给已移除、禁用或隐藏的旧按钮。
+     * @param {unknown} candidate 待检查的焦点候选节点。
+     * @returns {candidate is HTMLElement} 节点当前可见、已连接且允许聚焦时返回 true。
+     */
+    function isSafeFocusTarget(candidate) {
+      if (!(candidate instanceof HTMLElement) || !candidate.isConnected) return false;
+      if (candidate.matches(":disabled") || candidate.closest('[aria-hidden="true"]')) return false;
+      const style = window.getComputedStyle(candidate);
+      return style.display !== "none" && style.visibility !== "hidden" && candidate.getClientRects().length > 0;
+    }
+
+    /**
+     * 按优先级恢复焦点；指定目标全部失效时退回页面中首个安全控件，避免焦点遗留在已关闭浮层。
+     * @param {Array<unknown>} candidates 由业务语义决定的焦点候选节点，越靠前优先级越高。
+     * @returns {HTMLElement|null} 实际接收焦点的节点；页面无可用控件时返回 null。
+     */
+    function restoreFocus(candidates) {
+      const preferredTarget = candidates.find(isSafeFocusTarget);
+      const pageFallback = Array.from(document.querySelectorAll(focusableControlSelector)).find(isSafeFocusTarget);
+      const target = preferredTarget || pageFallback || null;
+      target?.focus({ preventScroll: true });
+      return target;
+    }
+
+    /**
+     * 返回浮层内按 DOM 顺序排列的可见焦点控件，供 Tab 与 Shift+Tab 边界判断使用。
+     * @param {HTMLElement} dialog 当前打开且声明为模态的对话框节点。
+     * @returns {Array<HTMLElement>} 当前可以接收键盘焦点的控件列表。
+     */
+    function getDialogFocusTargets(dialog) {
+      return Array.from(dialog.querySelectorAll(focusableControlSelector)).filter(isSafeFocusTarget);
+    }
+
+    /**
+     * 把 Tab 导航圈定在当前模态浮层；焦点意外位于背景时也会立即拉回首尾控件。
+     * @param {KeyboardEvent} event 当前键盘事件，仅处理 Tab 与 Shift+Tab。
+     * @param {HTMLElement} dialog 应限制焦点范围的当前对话框。
+     * @returns {void}
+     */
+    function trapDialogFocus(event, dialog) {
+      if (event.key !== "Tab") return;
+      const targets = getDialogFocusTargets(dialog);
+      if (targets.length === 0) {
+        /* 极端情况下所有表单控件都被禁用，仍阻止焦点穿透到背景并让对话框本身承接焦点。 */
+        event.preventDefault();
+        dialog.focus({ preventScroll: true });
+        return;
+      }
+
+      const firstTarget = targets[0];
+      const lastTarget = targets[targets.length - 1];
+      const activeTarget = document.activeElement;
+      const activeIndex = targets.indexOf(activeTarget);
+      if (activeIndex === -1 || (event.shiftKey && activeTarget === firstTarget)) {
+        event.preventDefault();
+        (event.shiftKey ? lastTarget : firstTarget).focus({ preventScroll: true });
+        return;
+      }
+      if (!event.shiftKey && activeTarget === lastTarget) {
+        event.preventDefault();
+        firstTarget.focus({ preventScroll: true });
+      }
+    }
 
     /**
      * 生成统一图标标记。
@@ -2294,6 +2379,7 @@
         .forEach((control) => { control.disabled = !canMutateData; });
       commandList.dataset.readonly = String(!canMutateData);
       commandList.querySelectorAll("[data-edit-id]").forEach((button) => { button.disabled = !canMutateData; });
+      commandList.querySelectorAll("[data-sort-id]").forEach((button) => { button.disabled = !canMutateData; });
       commandList.querySelectorAll("[data-command-id]").forEach((item) => { item.draggable = canMutateData; });
     }
 
@@ -2320,21 +2406,34 @@
       renderSync();
     }
 
-    /** 打开仓库设置并回填当前路径；浏览器原型只验证设置流程，不访问真实文件系统。 */
-    function openRepositoryDialog() {
+    /**
+     * 打开仓库设置并回填当前路径；浏览器原型只验证设置流程，不访问真实文件系统。
+     * @param {HTMLElement|null} triggerElement 打开对话框的控件，用于关闭后恢复焦点。
+     * @returns {void}
+     */
+    function openRepositoryDialog(triggerElement = document.activeElement) {
+      repositoryReturnFocusTarget = triggerElement instanceof HTMLElement ? triggerElement : null;
       repositoryPathInput.value = syncState.repositoryPath;
       repositoryError.textContent = "";
       repositoryDialogLayer.classList.add("is-open");
       repositoryDialogLayer.setAttribute("aria-hidden", "false");
-      window.setTimeout(() => repositoryPathInput.focus(), 80);
+      window.setTimeout(() => {
+        /* 快速按 Escape 关闭时不再把焦点异步送回隐藏输入框。 */
+        if (repositoryDialogLayer.classList.contains("is-open")) repositoryPathInput.focus({ preventScroll: true });
+      }, 80);
     }
 
-    /** 关闭仓库设置并把焦点归还同步入口。 */
+    /**
+     * 关闭仓库设置并把焦点归还实际触发入口；入口失效时使用仓库按钮或页面安全回退。
+     * @returns {void}
+     */
     function closeRepositoryDialog() {
+      const returnTarget = repositoryReturnFocusTarget;
       repositoryDialogLayer.classList.remove("is-open");
       repositoryDialogLayer.setAttribute("aria-hidden", "true");
       repositoryError.textContent = "";
-      repositoryButton.focus();
+      repositoryReturnFocusTarget = null;
+      restoreFocus([returnTarget, repositoryButton, pullButton, addCategoryButton]);
     }
 
     /**
@@ -2413,6 +2512,19 @@
       `).join("");
     }
 
+    /**
+     * 为排序手柄生成包含当前位置、总数、快捷键和边界状态的完整朗读标签。
+     * @param {object} command 当前命令视图模型。
+     * @param {number} index 当前命令从零开始的顺序索引。
+     * @param {number} total 当前分类中的命令总数。
+     * @returns {string} 可直接写入 aria-label 的中文操作说明。
+     */
+    function getSortHandleAriaLabel(command, index, total) {
+      const moveUpHint = index > 0 ? "按 Alt+上方向键上移" : "已在第一条，不能上移";
+      const moveDownHint = index < total - 1 ? "按 Alt+下方向键下移" : "已在最后一条，不能下移";
+      return `第 ${index + 1} 条，共 ${total} 条，“${command.title}”。${moveUpHint}；${moveDownHint}。`;
+    }
+
     /** 渲染当前分类的连续命令清单，并把展开条目组织为说明与输出双栏。 */
     function renderWorkspace() {
       const category = getActiveCategory();
@@ -2457,7 +2569,7 @@
             <button class="command-toggle" type="button" data-output-id="${command.id}" aria-expanded="${isOutputExpanded}" aria-controls="output-panel-${command.id}" aria-label="${isOutputExpanded ? "收起" : "展开"}${escapeHtml(command.title)}详情" data-od-id="output-toggle-${command.id}">
               ${icon("chevron")}
             </button>
-            <button class="drag-handle" type="button" title="拖动调整顺序" aria-label="${commandNumber}，拖动“${escapeHtml(command.title)}”调整顺序">${commandNumber}</button>
+            <button class="drag-handle" type="button" title="拖动调整顺序；键盘按 Alt+↑ 或 Alt+↓" data-sort-id="${command.id}" aria-label="${escapeHtml(getSortHandleAriaLabel(command, index, category.commands.length))}" data-od-id="sort-handle-${command.id}">${commandNumber}</button>
             <div class="command-heading">
               <h2 class="command-title" data-od-id="command-title-${command.id}">${escapeHtml(command.title)}</h2>
               ${command.risk ? '<span class="risk-badge">谨慎执行</span>' : ""}
@@ -2513,13 +2625,17 @@
     /**
      * 打开新增或编辑抽屉，并将焦点移动到首个字段。
      * @param {string|null} commandId 编辑时传入命令 ID；新增时保持为空。
+     * @param {HTMLElement|null} triggerElement 打开抽屉的控件，用于关闭后恢复焦点。
+     * @returns {void}
      */
-    function openDrawer(commandId = null) {
+    function openDrawer(commandId = null, triggerElement = document.activeElement) {
       if (!syncState.repositoryAvailable || syncState.operation) return;
       const category = getActiveCategory();
       if (!category) return;
       const command = commandId ? category.commands.find((item) => item.id === commandId) : null;
       editingCommandId = command?.id || null;
+      drawerReturnCommandId = command?.id || null;
+      drawerReturnFocusTarget = triggerElement instanceof HTMLElement ? triggerElement : null;
       commandForm.reset();
       formError.textContent = "";
       drawerTitle.textContent = command ? "编辑命令" : "添加命令";
@@ -2537,16 +2653,29 @@
 
       drawerLayer.classList.add("is-open");
       drawerLayer.setAttribute("aria-hidden", "false");
-      window.setTimeout(() => titleInput.focus(), 180);
+      window.setTimeout(() => {
+        /* 抽屉动画期间可能被 Escape 提前关闭，因此聚焦前必须复核当前开放状态。 */
+        if (drawerLayer.classList.contains("is-open")) titleInput.focus({ preventScroll: true });
+      }, 180);
     }
 
-    /** 关闭抽屉并清除编辑上下文，取消操作不会修改数据。 */
+    /**
+     * 关闭抽屉并清除编辑上下文；编辑按钮被列表重绘替换时按命令 ID 找到其语义等价节点。
+     * @returns {void}
+     */
     function closeDrawer() {
+      const returnTarget = drawerReturnFocusTarget;
+      const returnCommandId = drawerReturnCommandId;
       drawerLayer.classList.remove("is-open");
       drawerLayer.setAttribute("aria-hidden", "true");
       editingCommandId = null;
+      drawerReturnFocusTarget = null;
+      drawerReturnCommandId = null;
       formError.textContent = "";
-      document.getElementById("add-command-button").focus();
+      const renderedEditButton = returnCommandId
+        ? Array.from(commandList.querySelectorAll("[data-edit-id]")).find((button) => button.dataset.editId === returnCommandId)
+        : null;
+      restoreFocus([returnTarget, renderedEditButton, addCommandButton, repositoryButton]);
     }
 
     /**
@@ -2641,7 +2770,83 @@
         }
       }
 
-      if (editButton) openDrawer(editButton.dataset.editId);
+      if (editButton) openDrawer(editButton.dataset.editId, editButton);
+    });
+
+    /**
+     * 按命令 ID 查找当前渲染出的排序手柄；列表重绘后旧按钮会失效，因此不能长期保存 DOM 引用。
+     * @param {string} commandId 需要定位的命令 ID。
+     * @returns {HTMLElement|null} 当前命令的排序手柄；命令已不存在时返回 null。
+     */
+    function findSortHandle(commandId) {
+      return Array.from(commandList.querySelectorAll("[data-sort-id]"))
+        .find((button) => button.dataset.sortId === commandId) || null;
+    }
+
+    /**
+     * 在顺序重绘或保存回滚后把焦点归还同一命令的排序手柄，并为命令缺失场景保留安全回退。
+     * @param {string} commandId 需要恢复焦点的命令 ID。
+     * @returns {void}
+     */
+    function restoreSortHandleFocus(commandId) {
+      restoreFocus([findSortHandle(commandId), addCommandButton, repositoryButton]);
+    }
+
+    /**
+     * 使用键盘把一条命令移动一个位置，并复用桌面保存与失败回滚流程。
+     * @param {string} commandId 需要移动的命令 ID。
+     * @param {-1|1} direction -1 表示上移，1 表示下移。
+     * @returns {Promise<void>} 保存完成、失败回滚或边界提示结束后完成。
+     */
+    async function moveCommandByKeyboard(commandId, direction) {
+      if (!syncState.repositoryAvailable || syncState.operation) {
+        showToastFeedback("当前正在保存或同步，暂时不能调整顺序", "error", 2200);
+        return;
+      }
+      const category = getActiveCategory();
+      const fromIndex = category?.commands.findIndex((command) => command.id === commandId) ?? -1;
+      if (!category || fromIndex < 0) return;
+
+      const command = category.commands[fromIndex];
+      const targetIndex = fromIndex + direction;
+      if (targetIndex < 0 || targetIndex >= category.commands.length) {
+        /* 边界按键属于有效操作请求：保持原顺序和焦点，并通过现有 aria-live 反馈明确原因。 */
+        const boundary = direction < 0 ? "第一条，不能继续上移" : "最后一条，不能继续下移";
+        showToastFeedback(`“${command.title}”已在${boundary}`, "success", 2200);
+        return;
+      }
+
+      const previousCategories = structuredClone(categories);
+      const previousActiveCategoryId = activeCategoryId;
+      category.commands.splice(fromIndex, 1);
+      category.commands.splice(targetIndex, 0, command);
+      renderWorkspace();
+      renderSync();
+
+      const directionLabel = direction < 0 ? "上移" : "下移";
+      const resultMessage = `“${command.title}”已${directionLabel}至第 ${targetIndex + 1} 条，共 ${category.commands.length} 条`;
+      try {
+        const saved = await persistDesktopMutation(previousCategories, previousActiveCategoryId, resultMessage);
+        /* 浏览器预览不会由持久化函数显示成功消息，需在此补齐与桌面一致的 aria-live 结果反馈。 */
+        if (saved && !isDesktopRuntime) showToastFeedback(resultMessage);
+      } finally {
+        /* 保存成功会应用后端快照，失败会恢复旧快照；两条路径都必须重新定位同一命令。 */
+        restoreSortHandleFocus(commandId);
+      }
+    }
+
+    /**
+     * 排序手柄键盘入口仅响应 Alt+上/下方向键，避免覆盖普通列表浏览按键。
+     * @param {KeyboardEvent} event 命令列表内冒泡的键盘事件。
+     * @returns {void}
+     */
+    commandList.addEventListener("keydown", (event) => {
+      const handle = event.target.closest("[data-sort-id]");
+      const isMoveKey = event.key === "ArrowUp" || event.key === "ArrowDown";
+      if (!handle || !event.altKey || event.ctrlKey || event.metaKey || !isMoveKey) return;
+      event.preventDefault();
+      const direction = event.key === "ArrowUp" ? -1 : 1;
+      void moveCommandByKeyboard(handle.dataset.sortId, direction);
     });
 
     /** 拖拽排序：仅响应用户显式拖动，不根据使用频率自动重排。 */
@@ -2685,8 +2890,8 @@
       commandList.querySelectorAll(".is-dragging, .is-drag-over").forEach((node) => node.classList.remove("is-dragging", "is-drag-over"));
     });
 
-    /** 新增命令入口始终作用于当前分类。 */
-    document.getElementById("add-command-button").addEventListener("click", () => openDrawer());
+    /** 新增命令入口始终作用于当前分类，并作为关闭抽屉后的明确焦点返回点。 */
+    addCommandButton.addEventListener("click", () => openDrawer(null, addCommandButton));
     document.getElementById("drawer-close").addEventListener("click", closeDrawer);
     document.getElementById("drawer-cancel").addEventListener("click", closeDrawer);
     document.getElementById("drawer-dismiss").addEventListener("click", closeDrawer);
@@ -2736,6 +2941,7 @@
       const previousCategories = structuredClone(categories);
       const previousActiveCategoryId = activeCategoryId;
       const wasEditing = Boolean(editingCommandId);
+      const submittedCommandId = editingCommandId;
 
       if (editingCommandId) {
         const command = category.commands.find((item) => item.id === editingCommandId);
@@ -2774,10 +2980,15 @@
       render();
       closeDrawer();
       await persistDesktopMutation(previousCategories, previousActiveCategoryId, wasEditing ? "命令修改已保存" : "命令已保存");
+      /* 桌面保存成功和失败回滚都会最终重绘列表，必须在此重新查找存活按钮，不能复用关闭抽屉时的旧节点。 */
+      const persistedEditButton = wasEditing
+        ? Array.from(commandList.querySelectorAll("[data-edit-id]")).find((button) => button.dataset.editId === submittedCommandId)
+        : null;
+      restoreFocus([persistedEditButton, addCommandButton, repositoryButton]);
     });
 
     /** 同步入口只触发显式操作，不在后台或页面加载时自动访问网络。 */
-    repositoryButton.addEventListener("click", openRepositoryDialog);
+    repositoryButton.addEventListener("click", () => openRepositoryDialog(repositoryButton));
     pullButton.addEventListener("click", () => { void runSyncOperation("pull"); });
     pushButton.addEventListener("click", () => { void runSyncOperation("push"); });
     document.getElementById("repository-cancel").addEventListener("click", closeRepositoryDialog);
@@ -2983,17 +3194,28 @@
       showToastFeedback("数据仓库已连接");
     });
 
-    /** Escape 优先关闭最上层对话框，避免按键继续影响底层页面。 */
+    /**
+     * 统一管理最上层浮层的 Escape 与 Tab：仓库对话框优先级高于命令抽屉，键盘事件不会落入背景页面。
+     * @param {KeyboardEvent} event 页面级键盘事件。
+     * @returns {void}
+     */
     document.addEventListener("keydown", (event) => {
-      if (event.key !== "Escape") return;
       if (repositoryDialogLayer.classList.contains("is-open")) {
-        event.preventDefault();
-        closeRepositoryDialog();
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeRepositoryDialog();
+        } else {
+          trapDialogFocus(event, repositoryDialogLayer.querySelector(".repository-dialog"));
+        }
         return;
       }
       if (!drawerLayer.classList.contains("is-open")) return;
-      event.preventDefault();
-      closeDrawer();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeDrawer();
+      } else {
+        trapDialogFocus(event, drawerLayer.querySelector(".drawer"));
+      }
     });
 
     /**
