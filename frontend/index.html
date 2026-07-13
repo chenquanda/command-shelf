@@ -2532,6 +2532,16 @@
 
     /** 最近一次后端成功快照的文档哈希；桌面保存必须携带它以防覆盖应用外修改。 */
     let desktopDocumentHash = null;
+    /** 尚未写入磁盘的复制次数增量；按命令 ID 合并可压缩连续点击产生的完整文档写入。 */
+    const pendingCopyCountDeltas = new Map();
+    /** 当前复制计数保存排空任务；同一时刻最多存在一个，保证后续请求使用前一次返回的新哈希。 */
+    let copyCountPersistencePromise = null;
+    /** 正在等待剪贴板结果的正式命令复制数；其他写操作必须连同这个窗口一起等待。 */
+    let activeCopyPreparations = 0;
+    /** 当前一批剪贴板准备全部结束时完成的屏障，避免后续写操作越过尚未入队的复制计数。 */
+    let copyPreparationBarrier = Promise.resolve();
+    /** 结束当前剪贴板准备屏障的内部函数；没有活动复制时保持为空。 */
+    let resolveCopyPreparationBarrier = null;
 
     /** DOM 引用集中声明，避免后续交互逻辑重复查询并保持职责清晰。 */
     const categoryList = document.getElementById("category-list");
@@ -3152,6 +3162,9 @@
         return;
       }
       if (syncState.operation) return;
+      if (!await flushCopyCountPersistence()) return;
+      /* 等待期间另一项完整保存可能先取得互斥权；此时保持其原操作，不再启动 Git 进程。 */
+      if (syncState.operation) return;
 
       if (isDesktopRuntime) {
         if (operation === "push" && !syncState.hasLocalChanges) return;
@@ -3537,6 +3550,136 @@
     }
 
     /**
+     * 在所有分类中按稳定 ID 查找正式命令，供跨分类切换后的计数保存与失败回滚使用。
+     * @param {string} commandId 命令稳定 ID。
+     * @returns {object|null} 当前内存文档中的命令；命令已不存在时返回 null。
+     */
+    function findCommandById(commandId) {
+      return categories.flatMap((category) => category.commands)
+        .find((command) => command.id === commandId) || null;
+    }
+
+    /** 开始一次剪贴板写入准备，使紧随其后的其他文档操作能够等待复制结果。 */
+    function beginCopyPreparation() {
+      if (activeCopyPreparations === 0) {
+        copyPreparationBarrier = new Promise((resolve) => {
+          resolveCopyPreparationBarrier = resolve;
+        });
+      }
+      activeCopyPreparations += 1;
+    }
+
+    /** 结束一次剪贴板写入准备；最后一个准备结束后释放等待中的其他文档操作。 */
+    function finishCopyPreparation() {
+      activeCopyPreparations = Math.max(0, activeCopyPreparations - 1);
+      if (activeCopyPreparations !== 0) return;
+      const resolveBarrier = resolveCopyPreparationBarrier;
+      resolveCopyPreparationBarrier = null;
+      resolveBarrier?.();
+    }
+
+    /**
+     * 合并当前失败批次和等待中的新增量，并从内存模型及当前可见徽标中精确撤销。
+     * 已经由更早批次保存成功的次数不在这些增量中，因此不会被整份旧快照覆盖。
+     * @param {Map<string, number>} failedBatch 本次提交磁盘失败的复制次数增量。
+     * @param {object|null} error 后端结构化错误或运行时异常。
+     * @returns {false} 便于排空任务把失败结果传给所有等待者。
+     */
+    function rollbackUnsavedCopyCounts(failedBatch, error) {
+      const unsavedDeltas = new Map(failedBatch);
+      pendingCopyCountDeltas.forEach((delta, commandId) => {
+        unsavedDeltas.set(commandId, (unsavedDeltas.get(commandId) || 0) + delta);
+      });
+      pendingCopyCountDeltas.clear();
+
+      unsavedDeltas.forEach((delta, commandId) => {
+        const command = findCommandById(commandId);
+        if (!command) return;
+        const currentCount = Number.isSafeInteger(command.copyCount) && command.copyCount >= 0
+          ? command.copyCount
+          : 0;
+        command.copyCount = Math.max(0, currentCount - delta);
+        updateCommandCopyCountView(commandId, command.copyCount);
+      });
+
+      syncState.error = [error?.message, error?.action].filter(Boolean).join(" ") || "复制次数保存失败，未保存的计数已撤销。";
+      syncState.statusMessage = "磁盘中的最后有效数据未被本次复制计数覆盖。";
+      renderSync();
+      return false;
+    }
+
+    /**
+     * 串行排空复制次数增量；每批都捕获不可变文档并使用上一批返回的新哈希。
+     * 保存期间不写入全局 operation，也不应用后端返回的完整文档，避免锁界面或覆盖后来发生的乐观计数。
+     * @returns {Promise<boolean>} 全部增量成功保存时为 true，失败并精确回滚时为 false。
+     */
+    async function drainPendingCopyCountDeltas() {
+      if (!isDesktopRuntime) {
+        pendingCopyCountDeltas.clear();
+        markLocalChanges();
+        return true;
+      }
+
+      let activeBatch = new Map();
+      try {
+        while (pendingCopyCountDeltas.size > 0) {
+          activeBatch = new Map(pendingCopyCountDeltas);
+          pendingCopyCountDeltas.clear();
+          if (!desktopDocumentHash) {
+            return rollbackUnsavedCopyCounts(activeBatch, { message: "缺少最近有效文档哈希，复制次数保存已停止。" });
+          }
+
+          /* 在 IPC 前冻结文档；保存等待期间的新点击只进入下一批，不能悄悄改变本批请求。 */
+          const documentToSave = toDesktopDocument();
+          const expectedHash = desktopDocumentHash;
+          const snapshot = await window.__TAURI__.core.invoke("save_document", {
+            document: documentToSave,
+            expectedHash
+          });
+          applyDesktopSnapshotMetadata(snapshot);
+          activeBatch = new Map();
+        }
+      } catch (error) {
+        return rollbackUnsavedCopyCounts(activeBatch, error);
+      }
+
+      /* 只在最终状态确实变化后更新同步区域；命令卡片及其交互节点保持原位。 */
+      renderSync();
+      return true;
+    }
+
+    /**
+     * 记录一次已经成功复制的增量，并启动或复用唯一的后台排空任务。
+     * @param {string} commandId 被复制命令的稳定 ID。
+     * @returns {Promise<boolean>} 当前排空周期的最终保存结果。
+     */
+    function enqueueCopyCountPersistence(commandId) {
+      pendingCopyCountDeltas.set(commandId, (pendingCopyCountDeltas.get(commandId) || 0) + 1);
+      if (!copyCountPersistencePromise) {
+        copyCountPersistencePromise = Promise.resolve()
+          .then(drainPendingCopyCountDeltas)
+          .finally(() => {
+            copyCountPersistencePromise = null;
+          });
+      }
+      return copyCountPersistencePromise;
+    }
+
+    /**
+     * 等待剪贴板准备和复制计数保存全部完成，供其他文档修改、仓库切换及 Git 同步建立顺序屏障。
+     * @returns {Promise<boolean>} 没有待处理复制或全部保存成功时为 true；失败回滚后为 false。
+     */
+    async function flushCopyCountPersistence() {
+      let succeeded = true;
+      while (activeCopyPreparations > 0 || copyCountPersistencePromise) {
+        if (activeCopyPreparations > 0) await copyPreparationBarrier;
+        const persistence = copyCountPersistencePromise;
+        if (persistence) succeeded = (await persistence) && succeeded;
+      }
+      return succeeded;
+    }
+
+    /**
      * 复制正式命令正文，并在复制成功后把累计次数原子保存到 `commands.json`。
      * @param {object} command 被复制的正式命令视图模型。
      * @param {HTMLElement} originalButton 本次点击的复制按钮。
@@ -3547,37 +3690,38 @@
         showToastFeedback("当前正在保存或同步，请完成后再复制命令", "error", 2200);
         return;
       }
+      beginCopyPreparation();
+      let persistence = null;
       try {
-        await copyText(command.code);
-      } catch (error) {
-        showToastFeedback("复制失败，请手动选择命令", "error");
-        return;
+        try {
+          await copyText(command.code);
+        } catch (error) {
+          showToastFeedback("复制失败，请手动选择命令", "error");
+          return;
+        }
+
+        const currentCount = Number.isSafeInteger(command.copyCount) && command.copyCount >= 0
+          ? command.copyCount
+          : 0;
+        if (currentCount >= Number.MAX_SAFE_INTEGER) {
+          showCopiedFeedback(originalButton, "命令已复制；复制次数已到计数上限");
+          return;
+        }
+
+        command.copyCount = currentCount + 1;
+        updateCommandCopyCountView(command.id, command.copyCount);
+        persistence = enqueueCopyCountPersistence(command.id);
+      } finally {
+        /* 必须在增量已经入队后再释放屏障，其他保存才能看到并等待对应排空任务。 */
+        finishCopyPreparation();
       }
 
-      const currentCount = Number.isSafeInteger(command.copyCount) && command.copyCount >= 0
-        ? command.copyCount
-        : 0;
-      if (currentCount >= Number.MAX_SAFE_INTEGER) {
-        showCopiedFeedback(originalButton, "命令已复制；复制次数已到计数上限");
-        return;
-      }
-
-      const previousCategories = structuredClone(categories);
-      const previousActiveCategoryId = activeCategoryId;
-      const nextCount = currentCount + 1;
-      command.copyCount = nextCount;
-      updateCommandCopyCountView(command.id, nextCount);
-
-      const saved = await persistDesktopMutation(
-        previousCategories,
-        previousActiveCategoryId,
-        `命令已复制 · 累计 ${nextCount} 次`,
-        { renderMode: "sync-only" }
-      );
-      if (!saved) updateCommandCopyCountView(command.id, currentCount);
+      const saved = await persistence;
+      const latestCommand = findCommandById(command.id);
+      const latestCount = latestCommand?.copyCount || 0;
       const renderedButton = findCommandCopyButton(command.id);
       const resultMessage = saved
-        ? `命令已复制 · 累计 ${nextCount} 次`
+        ? `命令已复制 · 累计 ${latestCount} 次`
         : "命令已复制，但复制次数未保存";
       if (renderedButton) showCopiedFeedback(renderedButton, resultMessage);
       else showToastFeedback(resultMessage, saved ? "success" : "error", 2400);
@@ -3662,12 +3806,17 @@
      * @returns {Promise<void>} 保存成功、失败回滚或前置条件不满足时结束。
      */
     async function saveTemporaryCommand() {
-      const result = temporaryGenerationResult;
-      const category = getActiveCategory();
       if (!syncState.repositoryAvailable || syncState.operation) {
         showToastFeedback("当前正在保存或同步，请稍后再试", "error", 2200);
         return;
       }
+      if (!await flushCopyCountPersistence()) return;
+      if (syncState.operation) {
+        showToastFeedback("当前正在保存或同步，请稍后再试", "error", 2200);
+        return;
+      }
+      const result = temporaryGenerationResult;
+      const category = getActiveCategory();
       if (result?.status !== "generated" || !result.draft || temporaryGenerationCategoryId !== category?.id) return;
 
       const previousCategories = structuredClone(categories);
@@ -3745,6 +3894,11 @@
         showToastFeedback("当前正在保存或同步，暂时不能调整顺序", "error", 2200);
         return;
       }
+      if (!await flushCopyCountPersistence()) return;
+      if (syncState.operation) {
+        showToastFeedback("当前正在保存或同步，暂时不能调整顺序", "error", 2200);
+        return;
+      }
       const category = getActiveCategory();
       const fromIndex = category?.commands.findIndex((command) => command.id === commandId) ?? -1;
       if (!category || fromIndex < 0) return;
@@ -3784,6 +3938,11 @@
      */
     async function sortCurrentCategoryByCopyCount() {
       if (!syncState.repositoryAvailable || syncState.operation) {
+        showToastFeedback("当前正在保存或同步，暂时不能排序", "error", 2200);
+        return;
+      }
+      if (!await flushCopyCountPersistence()) return;
+      if (syncState.operation) {
         showToastFeedback("当前正在保存或同步，暂时不能排序", "error", 2200);
         return;
       }
@@ -3853,13 +4012,21 @@
 
     commandList.addEventListener("drop", async (event) => {
       const target = event.target.closest("[data-command-id]");
-      const category = getActiveCategory();
       if (!target || !draggedCommandId || target.dataset.commandId === draggedCommandId) return;
       event.preventDefault();
+      if (!syncState.repositoryAvailable || syncState.operation) return;
+      /* dragend 不会等待异步监听器，必须在等待复制计数前冻结来源、目标和分类 ID。 */
+      const sourceCommandId = draggedCommandId;
+      const targetCommandId = target.dataset.commandId;
+      const categoryId = activeCategoryId;
+      if (!await flushCopyCountPersistence() || syncState.operation) return;
+      const category = categories.find((candidate) => candidate.id === categoryId);
+      if (!category) return;
       const previousCategories = structuredClone(categories);
       const previousActiveCategoryId = activeCategoryId;
-      const fromIndex = category.commands.findIndex((item) => item.id === draggedCommandId);
-      const toIndex = category.commands.findIndex((item) => item.id === target.dataset.commandId);
+      const fromIndex = category.commands.findIndex((item) => item.id === sourceCommandId);
+      const toIndex = category.commands.findIndex((item) => item.id === targetCommandId);
+      if (fromIndex < 0 || toIndex < 0) return;
       const [moved] = category.commands.splice(fromIndex, 1);
       category.commands.splice(toIndex, 0, moved);
       renderWorkspace();
@@ -3887,6 +4054,7 @@
      */
     document.getElementById("add-category-button").addEventListener("click", async () => {
       if (!syncState.repositoryAvailable || syncState.operation) return;
+      if (!await flushCopyCountPersistence() || syncState.operation) return;
       const name = window.prompt("请输入分类名称");
       const normalized = name?.trim();
       if (!normalized || categories.some((category) => category.name === normalized)) return;
@@ -3904,6 +4072,14 @@
       event.preventDefault();
       if (!syncState.repositoryAvailable) {
         formError.textContent = "数据仓库当前不可用，请重新选择仓库后再修改。";
+        return;
+      }
+      if (syncState.operation) {
+        formError.textContent = "当前正在保存或同步，请等待操作结束后再修改。";
+        return;
+      }
+      if (!await flushCopyCountPersistence()) {
+        formError.textContent = "复制次数保存失败，命令修改已停止，请重试。";
         return;
       }
       if (syncState.operation) {
@@ -4050,7 +4226,26 @@
     }
 
     /**
-     * 原子应用后端快照，避免仓库路径、状态和可见文档来自不同加载批次。
+     * 只应用后端快照中的仓库、同步状态与文档哈希，不替换当前内存文档或触发渲染。
+     * 复制计数后台保存使用该路径，避免响应快照覆盖等待期间出现的新复制增量。
+     * @param {object} snapshot Tauri 后端返回的完整应用快照。
+     * @returns {void}
+     */
+    function applyDesktopSnapshotMetadata(snapshot) {
+      syncState.repositoryPath = snapshot.repositoryPath || "";
+      syncState.repositoryAvailable = Boolean(snapshot.repositoryPath) && snapshot.syncState !== "error";
+      syncState.hasLocalChanges = snapshot.syncState === "dirty";
+      syncState.operation = null;
+      syncState.error = snapshot.error
+        ? `${snapshot.error.message} ${snapshot.error.action}`
+        : snapshot.syncState === "error" ? snapshot.statusMessage : null;
+      syncState.statusMessage = snapshot.statusMessage || "";
+      syncState.lastSyncedText = "本次启动";
+      desktopDocumentHash = snapshot.documentHash || null;
+    }
+
+    /**
+     * 原子应用后端完整快照，避免仓库路径、状态和可见文档来自不同加载批次。
      * @param {object} snapshot Tauri 后端返回的完整应用快照。
      * @param {{preserveView?: boolean, renderMode?: "full"|"sync-only"}} options 保存后是否保留视图，以及是否只刷新同步控件。
      */
@@ -4068,16 +4263,7 @@
       } else if (categories[0]?.commands[0]) {
         expandedCommandIds.add(categories[0].commands[0].id);
       }
-      syncState.repositoryPath = snapshot.repositoryPath || "";
-      syncState.repositoryAvailable = Boolean(snapshot.repositoryPath) && snapshot.syncState !== "error";
-      syncState.hasLocalChanges = snapshot.syncState === "dirty";
-      syncState.operation = null;
-      syncState.error = snapshot.error
-        ? `${snapshot.error.message} ${snapshot.error.action}`
-        : snapshot.syncState === "error" ? snapshot.statusMessage : null;
-      syncState.statusMessage = snapshot.statusMessage || "";
-      syncState.lastSyncedText = "本次启动";
-      desktopDocumentHash = snapshot.documentHash || null;
+      applyDesktopSnapshotMetadata(snapshot);
       if (renderMode === "sync-only") renderSync();
       else render();
     }
@@ -4156,6 +4342,14 @@
       if (!repositoryPath) {
         repositoryError.textContent = "请选择或填写本地 Git 仓库路径。";
         repositoryPathInput.focus();
+        return;
+      }
+      if (!await flushCopyCountPersistence()) {
+        repositoryError.textContent = "复制次数保存失败，仓库切换已停止，请先重试复制。";
+        return;
+      }
+      if (syncState.operation) {
+        repositoryError.textContent = "当前正在保存或同步，请等待操作结束后再更换仓库。";
         return;
       }
       if (syncState.repositoryPath && syncState.hasLocalChanges && repositoryPath !== syncState.repositoryPath) {

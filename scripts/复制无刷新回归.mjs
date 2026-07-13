@@ -1,6 +1,6 @@
 /**
- * 文件职责：验证正式命令复制并保存计数时不会重建命令列表。
- * 主要内容：用 Edge DevTools 注入最小 Tauri 契约，驱动真实前端复制入口并核对 DOM 身份。
+ * 文件职责：验证正式命令复制计数的局部更新、串行保存与失败回滚。
+ * 主要内容：用 Edge DevTools 注入最小 Tauri 契约，驱动真实前端复制入口并核对 DOM 身份与保存顺序。
  * 重要约束：浏览器配置和运行证据只写入项目 `.local`，不读取个人 APPDATA 或命令仓库。
  */
 
@@ -162,6 +162,13 @@ function createTauriStub() {
   return `(() => {
     const initialDocument = ${JSON.stringify(document)};
     window.__savedDocument = null;
+    window.__saveRequests = [];
+    window.__activeSaveCalls = 0;
+    window.__maxActiveSaveCalls = 0;
+    window.__savedRevision = 0;
+    window.__failNextSave = false;
+    window.__operationOrder = [];
+    window.__pushDuringSave = false;
     window.__TAURI__ = { core: { invoke: async (command, args = {}) => {
       if (command === "load_app") {
         return {
@@ -174,14 +181,49 @@ function createTauriStub() {
         };
       }
       if (command === "save_document") {
-        window.__savedDocument = structuredClone(args.document);
-        await new Promise((resolve) => setTimeout(resolve, 80));
-        return {
+        const request = {
+          expectedHash: args.expectedHash,
           document: structuredClone(args.document),
+          completed: false,
+          failed: false
+        };
+        window.__saveRequests.push(request);
+        window.__operationOrder.push("save:start");
+        window.__activeSaveCalls += 1;
+        window.__maxActiveSaveCalls = Math.max(window.__maxActiveSaveCalls, window.__activeSaveCalls);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          if (window.__failNextSave) {
+            window.__failNextSave = false;
+            request.failed = true;
+            window.__operationOrder.push("save:failed");
+            throw { message: "测试注入的保存失败。", action: "请重试复制。" };
+          }
+          window.__savedRevision += 1;
+          window.__savedDocument = structuredClone(args.document);
+          request.completed = true;
+          window.__operationOrder.push("save:complete");
+          return {
+            document: structuredClone(args.document),
+            repositoryPath: "F:\\\\isolated-command-shelf-data",
+            syncState: "dirty",
+            statusMessage: "复制次数已保存。",
+            documentHash: "hash-after-save-" + window.__savedRevision,
+            error: null
+          };
+        } finally {
+          window.__activeSaveCalls -= 1;
+        }
+      }
+      if (command === "push_repository") {
+        window.__pushDuringSave = window.__activeSaveCalls > 0;
+        window.__operationOrder.push("push:start");
+        return {
+          document: structuredClone(window.__savedDocument),
           repositoryPath: "F:\\\\isolated-command-shelf-data",
-          syncState: "dirty",
-          statusMessage: "复制次数已保存。",
-          documentHash: "hash-after-copy",
+          syncState: "synced",
+          statusMessage: "测试推送已完成。",
+          documentHash: "hash-after-save-" + window.__savedRevision,
           error: null
         };
       }
@@ -266,7 +308,120 @@ async function main() {
     if (!evidence.cardStillConnected || !evidence.sameCard || !evidence.sameCopyButton) {
       throw new Error(`复制后命令卡片被整体替换：${JSON.stringify(evidence)}`);
     }
-    process.stdout.write(`${JSON.stringify({ status: "passed", ...evidence })}\n`);
+
+    /* 连续复制与新增分类同时发生时，新增必须等待全部复制计数串行落盘。 */
+    await evaluate(client.send, `(() => {
+      window.__saveRequests = [];
+      window.__maxActiveSaveCalls = 0;
+      window.prompt = () => '串行保存分类';
+      const copyButton = document.querySelector('[data-copy-id]');
+      window.__copyButtonDuringQueue = copyButton;
+      copyButton.click();
+      document.getElementById('add-category-button').click();
+      return true;
+    })()`);
+    await waitForCondition(
+      client.send,
+      "window.__activeSaveCalls > 0",
+      "连续复制进入异步保存",
+    );
+    const inFlightEvidence = await evaluate(client.send, `({
+      operation: syncState.operation,
+      listReadonly: document.getElementById('command-list').dataset.readonly,
+      copyConnected: window.__copyButtonDuringQueue.isConnected,
+      copyDisabled: window.__copyButtonDuringQueue.disabled,
+      addCategoryDisabled: document.getElementById('add-category-button').disabled
+    })`);
+    if (inFlightEvidence.operation || inFlightEvidence.listReadonly === "true" || !inFlightEvidence.copyConnected || inFlightEvidence.copyDisabled || inFlightEvidence.addCategoryDisabled) {
+      throw new Error(`复制计数保存期间错误锁定了界面：${JSON.stringify(inFlightEvidence)}`);
+    }
+    await evaluate(client.send, `(() => {
+      window.__copyButtonDuringQueue.click();
+      window.__copyButtonDuringQueue.click();
+      return true;
+    })()`);
+    await waitForCondition(
+      client.send,
+      "window.__activeSaveCalls === 0 && window.__savedDocument?.categories?.length === 2 && window.__savedDocument.categories[0].commands[0].copyCount === 4",
+      "连续复制与后续分类保存全部完成",
+    );
+
+    const serialEvidence = await evaluate(client.send, `({
+      maxActiveSaveCalls: window.__maxActiveSaveCalls,
+      requests: window.__saveRequests.map((request) => ({
+        expectedHash: request.expectedHash,
+        copyCount: request.document.categories[0].commands[0].copyCount,
+        categoryCount: request.document.categories.length,
+        completed: request.completed,
+        failed: request.failed
+      })),
+      savedCount: window.__savedDocument.categories[0].commands[0].copyCount
+    })`);
+    const requestsAreSerial = serialEvidence.requests.length === 3
+      && serialEvidence.requests[0].expectedHash === "hash-after-save-1"
+      && serialEvidence.requests[0].copyCount === 2
+      && serialEvidence.requests[0].categoryCount === 1
+      && serialEvidence.requests[1].expectedHash === "hash-after-save-2"
+      && serialEvidence.requests[1].copyCount === 4
+      && serialEvidence.requests[1].categoryCount === 1
+      && serialEvidence.requests[2].expectedHash === "hash-after-save-3"
+      && serialEvidence.requests[2].copyCount === 4
+      && serialEvidence.requests[2].categoryCount === 2
+      && serialEvidence.requests.every((request) => request.completed && !request.failed);
+    if (serialEvidence.maxActiveSaveCalls !== 1 || !requestsAreSerial) {
+      throw new Error(`复制与后续修改未按文档哈希串行保存：${JSON.stringify(serialEvidence)}`);
+    }
+
+    /* Git 推送复用同一顺序屏障，必须在剪贴板准备与计数写盘完成后才能启动。 */
+    await evaluate(client.send, `(() => {
+      document.querySelector('[data-category-id="regression-category"]').click();
+      window.__operationOrder = [];
+      window.__pushDuringSave = false;
+      document.querySelector('[data-copy-id]').click();
+      window.__pushPromise = runSyncOperation('push');
+      return true;
+    })()`);
+    await waitForCondition(
+      client.send,
+      "window.__operationOrder.includes('push:start') && window.__activeSaveCalls === 0 && !syncState.operation && window.__savedDocument.categories[0].commands[0].copyCount === 5",
+      "复制计数保存后启动 Git 推送",
+    );
+    const pushEvidence = await evaluate(client.send, `({
+      operationOrder: window.__operationOrder,
+      pushDuringSave: window.__pushDuringSave,
+      savedCount: window.__savedDocument.categories[0].commands[0].copyCount,
+      hasLocalChanges: syncState.hasLocalChanges
+    })`);
+    const saveCompletedAt = pushEvidence.operationOrder.indexOf("save:complete");
+    const pushStartedAt = pushEvidence.operationOrder.indexOf("push:start");
+    if (pushEvidence.pushDuringSave || saveCompletedAt < 0 || pushStartedAt <= saveCompletedAt || pushEvidence.savedCount !== 5 || pushEvidence.hasLocalChanges) {
+      throw new Error(`Git 推送越过了复制计数保存屏障：${JSON.stringify(pushEvidence)}`);
+    }
+
+    /* 同批复制保存失败时，只撤销尚未落盘的增量，不破坏此前成功保存的累计值。 */
+    await evaluate(client.send, `(() => {
+      window.__failNextSave = true;
+      const copyButton = document.querySelector('[data-copy-id]');
+      copyButton.click();
+      copyButton.click();
+      return true;
+    })()`);
+    await waitForCondition(
+      client.send,
+      "window.__activeSaveCalls === 0 && document.querySelector('[data-copy-count-id]')?.textContent === '复制 5 次' && Boolean(syncState.error)",
+      "失败批次回滚到最后成功计数",
+    );
+    const failureEvidence = await evaluate(client.send, `({
+      visibleCount: document.querySelector('[data-copy-count-id]').textContent,
+      savedCount: window.__savedDocument.categories[0].commands[0].copyCount,
+      failedRequest: window.__saveRequests.at(-1).failed,
+      maxActiveSaveCalls: window.__maxActiveSaveCalls
+    })`);
+    if (failureEvidence.visibleCount !== "复制 5 次" || failureEvidence.savedCount !== 5 || !failureEvidence.failedRequest || failureEvidence.maxActiveSaveCalls !== 1) {
+      throw new Error(`复制保存失败回滚不完整：${JSON.stringify(failureEvidence)}`);
+    }
+
+    process.stdout.write(`${JSON.stringify({ status: "passed", ...evidence, inFlightEvidence, serialEvidence, pushEvidence, failureEvidence })}\n`);
   } finally {
     client?.close();
     edge.kill();
