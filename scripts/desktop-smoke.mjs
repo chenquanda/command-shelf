@@ -364,7 +364,9 @@ async function verifyLocalEditing(send) {
     `(() => {
       window.__copiedValues = [];
       copyText = async (text) => { window.__copiedValues.push(text); };
-      document.querySelector('[data-copy-id]').click();
+      window.__firstCommandCardBeforeCopy = document.querySelector('[data-command-id]');
+      window.__firstCopyButtonBeforeCopy = document.querySelector('[data-copy-id]');
+      window.__firstCopyButtonBeforeCopy.click();
       return true;
     })()`,
   );
@@ -373,6 +375,17 @@ async function verifyLocalEditing(send) {
     "window.__copiedValues?.length === 1 && document.querySelector('[data-copy-count-id]')?.textContent === '复制 1 次' && document.getElementById('sync-status-label')?.textContent === '本地有修改'",
     "首条命令复制后计数保存",
   );
+  const copyDomIdentity = await evaluate(
+    send,
+    `({
+      cardStillConnected: window.__firstCommandCardBeforeCopy?.isConnected,
+      sameCard: window.__firstCommandCardBeforeCopy === document.querySelector('[data-command-id]'),
+      sameCopyButton: window.__firstCopyButtonBeforeCopy === document.querySelector('[data-copy-id]')
+    })`,
+  );
+  if (!copyDomIdentity.cardStillConnected || !copyDomIdentity.sameCard || !copyDomIdentity.sameCopyButton) {
+    throw new Error(`复制次数保存后命令列表发生了整体重绘：${JSON.stringify(copyDomIdentity)}`);
+  }
   await evaluate(send, "document.querySelector('[data-copy-output-id]').click(); true");
   await waitForCondition(send, "window.__copiedValues?.length === 2", "参考输出复制但不增加命令次数");
 

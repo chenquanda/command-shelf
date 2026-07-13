@@ -21,6 +21,7 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 - Tauri 后端：`src-tauri/src`。
 - Tauri 配置：`src-tauri/tauri.conf.json`。
 - 桌面验收脚本：`scripts/desktop-smoke.mjs`。
+- 复制无刷新回归：`scripts/复制无刷新回归.mjs`，通过隔离 Tauri 契约检查复制计数保存不替换命令卡片。
 - 发布门禁：`scripts/release-candidate.ps1`。
 - 安装包：`release/CommandShelf_0.1.0_x64-setup.exe`。
 - 本机构建缓存和临时证据统一放在 `.local`，不得提交。
@@ -130,6 +131,7 @@ cargo fmt --manifest-path src-tauri\Cargo.toml --check
 cargo test --manifest-path src-tauri\Cargo.toml --all-targets
 cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
 node --check scripts\desktop-smoke.mjs
+node scripts\复制无刷新回归.mjs
 ```
 
 正式发布使用：

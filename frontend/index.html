@@ -3483,13 +3483,27 @@
     }
 
     /**
-     * 重新定位一条正式命令当前渲染出的复制按钮；保存快照会重绘列表，不能继续使用旧节点。
+     * 定位一条正式命令当前渲染出的复制按钮；失败回滚或分类切换后也以稳定 ID 查找。
      * @param {string} commandId 命令稳定 ID。
      * @returns {HTMLElement|null} 当前分类仍可见时返回复制按钮，否则返回 null。
      */
     function findCommandCopyButton(commandId) {
       return Array.from(commandList.querySelectorAll("[data-copy-id]"))
         .find((button) => button.dataset.copyId === commandId) || null;
+    }
+
+    /**
+     * 原位更新正式命令的复制次数，避免仅有一个数字变化时重建整个命令列表。
+     * @param {string} commandId 命令稳定 ID。
+     * @param {number} copyCount 已通过安全整数边界校验的累计次数。
+     * @returns {boolean} 当前分类仍展示该命令并完成更新时为 true。
+     */
+    function updateCommandCopyCountView(commandId, copyCount) {
+      const badge = Array.from(commandList.querySelectorAll("[data-copy-count-id]"))
+        .find((candidate) => candidate.dataset.copyCountId === commandId);
+      if (!badge) return false;
+      badge.textContent = `复制 ${copyCount} 次`;
+      return true;
     }
 
     /**
@@ -3522,14 +3536,15 @@
       const previousActiveCategoryId = activeCategoryId;
       const nextCount = currentCount + 1;
       command.copyCount = nextCount;
-      renderWorkspace();
-      renderSync();
+      updateCommandCopyCountView(command.id, nextCount);
 
       const saved = await persistDesktopMutation(
         previousCategories,
         previousActiveCategoryId,
-        `命令已复制 · 累计 ${nextCount} 次`
+        `命令已复制 · 累计 ${nextCount} 次`,
+        { renderMode: "sync-only" }
       );
+      if (!saved) updateCommandCopyCountView(command.id, currentCount);
       const renderedButton = findCommandCopyButton(command.id);
       const resultMessage = saved
         ? `命令已复制 · 累计 ${nextCount} 次`
@@ -4007,9 +4022,9 @@
     /**
      * 原子应用后端快照，避免仓库路径、状态和可见文档来自不同加载批次。
      * @param {object} snapshot Tauri 后端返回的完整应用快照。
-     * @param {{preserveView?: boolean}} options 保存后是否保留当前分类与展开条目。
+     * @param {{preserveView?: boolean, renderMode?: "full"|"sync-only"}} options 保存后是否保留视图，以及是否只刷新同步控件。
      */
-    function applyDesktopSnapshot(snapshot, { preserveView = false } = {}) {
+    function applyDesktopSnapshot(snapshot, { preserveView = false, renderMode = "full" } = {}) {
       const previousActiveCategoryId = activeCategoryId;
       const previousExpandedIds = new Set(expandedCommandIds);
       categories = mapDesktopDocument(snapshot.document);
@@ -4033,7 +4048,8 @@
       syncState.statusMessage = snapshot.statusMessage || "";
       syncState.lastSyncedText = "本次启动";
       desktopDocumentHash = snapshot.documentHash || null;
-      render();
+      if (renderMode === "sync-only") renderSync();
+      else render();
     }
 
     /**
@@ -4041,9 +4057,10 @@
      * @param {Array<object>} previousCategories 修改前的深拷贝分类数据。
      * @param {string|null} previousActiveCategoryId 修改前选中的分类 ID。
      * @param {string} successMessage 成功后展示的短消息。
+     * @param {{renderMode?: "full"|"sync-only"}} options 保存期间与完成后的渲染范围；复制计数使用局部模式保留 DOM。
      * @returns {Promise<boolean>} 成功保存或浏览器原型标记完成时为 true。
      */
-    async function persistDesktopMutation(previousCategories, previousActiveCategoryId, successMessage) {
+    async function persistDesktopMutation(previousCategories, previousActiveCategoryId, successMessage, { renderMode = "full" } = {}) {
       if (!isDesktopRuntime) {
         markLocalChanges();
         return true;
@@ -4052,7 +4069,8 @@
         categories = previousCategories;
         activeCategoryId = previousActiveCategoryId;
         syncState.error = "缺少最近有效文档哈希，保存已停止。";
-        render();
+        if (renderMode === "sync-only") renderSync();
+        else render();
         showToastFeedback("保存失败，界面已恢复", "error", 2600);
         return false;
       }
@@ -4060,13 +4078,14 @@
       syncState.operation = "save";
       syncState.error = null;
       syncState.statusMessage = "正在备份并原子写入 commands.json。";
-      render();
+      if (renderMode === "sync-only") renderSync();
+      else render();
       try {
         const snapshot = await window.__TAURI__.core.invoke("save_document", {
           document: toDesktopDocument(),
           expectedHash: desktopDocumentHash
         });
-        applyDesktopSnapshot(snapshot, { preserveView: true });
+        applyDesktopSnapshot(snapshot, { preserveView: true, renderMode });
         showToastFeedback(successMessage);
         return true;
       } catch (error) {
@@ -4075,7 +4094,8 @@
         syncState.operation = null;
         syncState.error = [error?.message, error?.action].filter(Boolean).join(" ") || "本地保存失败，界面已恢复。";
         syncState.statusMessage = "磁盘中的最后有效数据未被本次操作覆盖。";
-        render();
+        if (renderMode === "sync-only") renderSync();
+        else render();
         showToastFeedback("保存失败，界面已恢复", "error", 2800);
         return false;
       }
