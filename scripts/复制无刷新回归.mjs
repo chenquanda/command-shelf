@@ -287,6 +287,27 @@ async function main() {
     await evaluate(client.send, `(() => {
       window.__cardBeforeCopy = document.querySelector('[data-command-id]');
       window.__copyButtonBeforeCopy = document.querySelector('[data-copy-id]');
+      window.__copyMutations = [];
+      window.__describeCopyMutation = (record) => {
+        const element = record.target.nodeType === Node.TEXT_NODE
+          ? record.target.parentElement
+          : record.target;
+        return {
+          type: record.type,
+          id: element?.id || null,
+          copyCountId: element?.closest?.('[data-copy-count-id]')?.dataset.copyCountId || null,
+          attribute: record.attributeName || null
+        };
+      };
+      window.__copyMutationObserver = new MutationObserver((records) => {
+        records.forEach((record) => window.__copyMutations.push(window.__describeCopyMutation(record)));
+      });
+      window.__copyMutationObserver.observe(document.body, {
+        subtree: true,
+        attributes: true,
+        childList: true,
+        characterData: true
+      });
       copyText = async () => {};
       window.__copyButtonBeforeCopy.click();
       return true;
@@ -297,16 +318,33 @@ async function main() {
       "复制次数保存完成",
     );
 
-    const evidence = await evaluate(client.send, `({
-      cardStillConnected: window.__cardBeforeCopy.isConnected,
-      sameCard: window.__cardBeforeCopy === document.querySelector('[data-command-id]'),
-      sameCopyButton: window.__copyButtonBeforeCopy === document.querySelector('[data-copy-id]'),
-      countText: document.querySelector('[data-copy-count-id]').textContent,
-      savedCount: window.__savedDocument.categories[0].commands[0].copyCount,
-      syncLabel: document.getElementById('sync-status-label').textContent
-    })`);
+    const evidence = await evaluate(client.send, `(() => {
+      window.__copyMutationObserver.takeRecords()
+        .forEach((record) => window.__copyMutations.push(window.__describeCopyMutation(record)));
+      window.__copyMutationObserver.disconnect();
+      return {
+        cardStillConnected: window.__cardBeforeCopy.isConnected,
+        sameCard: window.__cardBeforeCopy === document.querySelector('[data-command-id]'),
+        sameCopyButton: window.__copyButtonBeforeCopy === document.querySelector('[data-copy-id]'),
+        countText: document.querySelector('[data-copy-count-id]').textContent,
+        savedCount: window.__savedDocument.categories[0].commands[0].copyCount,
+        syncLabel: document.getElementById('sync-status-label').textContent,
+        copyButtonLabel: window.__copyButtonBeforeCopy.querySelector('span').textContent,
+        copyButtonIcon: window.__copyButtonBeforeCopy.querySelector('use').getAttribute('href'),
+        copyButtonClassChanged: window.__copyButtonBeforeCopy.classList.contains('is-copied'),
+        toastVisible: document.getElementById('toast').classList.contains('is-visible'),
+        mutations: window.__copyMutations
+      };
+    })()`);
     if (!evidence.cardStillConnected || !evidence.sameCard || !evidence.sameCopyButton) {
       throw new Error(`复制后命令卡片被整体替换：${JSON.stringify(evidence)}`);
+    }
+    const allowedSyncMutationIds = new Set(["sync-status", "sync-status-label", "sync-meta", "push-button"]);
+    const unexpectedMutations = evidence.mutations.filter((mutation) => (
+      mutation.copyCountId !== "regression-command" && !allowedSyncMutationIds.has(mutation.id)
+    ));
+    if (evidence.copyButtonLabel !== "复制" || evidence.copyButtonIcon !== "#icon-copy" || evidence.copyButtonClassChanged || evidence.toastVisible || unexpectedMutations.length > 0) {
+      throw new Error(`正常复制改动了计数和同步状态以外的界面：${JSON.stringify({ evidence, unexpectedMutations })}`);
     }
 
     /* 连续复制与新增分类同时发生时，新增必须等待全部复制计数串行落盘。 */

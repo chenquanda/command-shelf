@@ -3717,14 +3717,12 @@
       }
 
       const saved = await persistence;
-      const latestCommand = findCommandById(command.id);
-      const latestCount = latestCommand?.copyCount || 0;
+      /* 正常成功时计数徽标已经给出即时反馈；不再改按钮或弹 Toast，避免制造无关重绘。 */
+      if (saved) return;
       const renderedButton = findCommandCopyButton(command.id);
-      const resultMessage = saved
-        ? `命令已复制 · 累计 ${latestCount} 次`
-        : "命令已复制，但复制次数未保存";
+      const resultMessage = "命令已复制，但复制次数未保存";
       if (renderedButton) showCopiedFeedback(renderedButton, resultMessage);
-      else showToastFeedback(resultMessage, saved ? "success" : "error", 2400);
+      else showToastFeedback(resultMessage, "error", 2400);
     }
 
     /** 分类点击委托：切换后保持分类顺序稳定并立即刷新内容。 */
