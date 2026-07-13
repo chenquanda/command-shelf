@@ -10,6 +10,7 @@ mod error;
 mod file_io;
 mod git_repository;
 mod model;
+mod process_runner;
 
 use app_service::AppService;
 use config_store::default_config_directory;
