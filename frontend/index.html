@@ -1975,6 +1975,36 @@
       overflow-y: auto;
     }
 
+    /* 两次生成失败后在同一对话框内人工整理，避免再打开功能更重的正式编辑抽屉。 */
+    .codex-manual-fields {
+      display: grid;
+      gap: 14px;
+      margin-top: 20px;
+      padding-top: 20px;
+      border-top: 1px solid var(--paper-line);
+    }
+
+    .codex-manual-fields[hidden],
+    .codex-question-field[hidden] { display: none; }
+
+    .codex-manual-fields h3 {
+      margin: 0;
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .codex-manual-description {
+      margin: -6px 0 2px;
+      color: var(--ink-soft);
+      font-size: 11px;
+      line-height: 1.65;
+    }
+
+    .codex-manual-command,
+    .codex-manual-output { min-height: 92px; }
+
     .codex-dialog-footer {
       display: flex;
       justify-content: flex-end;
@@ -2199,7 +2229,7 @@
         <h2 id="codex-dialog-title">问 Codex</h2>
         <p class="codex-dialog-description">描述你想完成的操作。Codex 只生成命令与说明，CommandShelf 绝不会执行这条命令。</p>
         <p class="codex-cli-status" id="codex-cli-status" data-state="checking" role="status" aria-live="polite">正在检查本机 Codex CLI…</p>
-        <label class="field">
+        <label class="field codex-question-field" id="codex-question-field">
           <span class="field-label">你想查什么命令？ <span class="required">*</span></span>
           <textarea class="text-area codex-question-input" id="codex-question-input" name="question" maxlength="2000" placeholder="例如：查看占用 8080 端口的进程，并显示进程详情" required></textarea>
           <span class="field-hint">建议说明系统环境、目标和必要限制；内容只通过标准输入发送给本机 Codex CLI。</span>
@@ -2210,6 +2240,43 @@
           <strong class="codex-result-title" id="codex-result-title"></strong>
           <code class="codex-result-command" id="codex-result-command"></code>
           <pre class="codex-raw-response" id="codex-raw-response" hidden></pre>
+        </section>
+        <section class="codex-manual-fields" id="codex-manual-fields" aria-labelledby="codex-manual-title" hidden>
+          <h3 id="codex-manual-title">手动整理命令</h3>
+          <p class="codex-manual-description">参考上方原始响应补全字段。这里只创建临时结果，不会写入 commands.json。</p>
+          <label class="field">
+            <span class="field-label">任务标题 <span class="required">*</span></span>
+            <input class="text-input" id="codex-manual-title-input" type="text" maxlength="40" autocomplete="off" placeholder="例如：查看端口占用" required>
+          </label>
+          <label class="field">
+            <span class="field-label">命令正文 <span class="required">*</span></span>
+            <textarea class="text-area codex-manual-command" id="codex-manual-command-input" maxlength="2000" spellcheck="false" placeholder="例如：lsof -i :&lt;port&gt;" required></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">命令说明</span>
+            <textarea class="text-area" id="codex-manual-description-input" maxlength="4000" placeholder="说明用途、适用环境或前提。"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">用法</span>
+            <textarea class="text-area" id="codex-manual-usage-input" maxlength="2000" spellcheck="false" placeholder="说明在哪里运行以及需要替换的内容。"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">参数说明</span>
+            <textarea class="text-area" id="codex-manual-parameters-input" maxlength="1000" spellcheck="false" placeholder="每行一个参数，例如：&#10;&lt;port&gt; = 需要检查的端口号"></textarea>
+            <span class="field-hint">使用“参数 = 说明”的格式；没有额外参数时可以留空。</span>
+          </label>
+          <label class="field">
+            <span class="field-label">参考输出 <span class="required">*</span></span>
+            <textarea class="text-area codex-manual-output" id="codex-manual-output-input" maxlength="1800" spellcheck="false" placeholder="填写一段用于识别结果形态的典型输出。" required></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">风险提示</span>
+            <textarea class="text-area" id="codex-manual-risk-input" maxlength="1000" placeholder="涉及删除、覆盖、强制操作时说明风险；没有则留空。"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">补充说明</span>
+            <textarea class="text-area" id="codex-manual-notes-input" maxlength="2000" placeholder="填写其他限制或个人备注。"></textarea>
+          </label>
         </section>
         <footer class="codex-dialog-footer">
           <button class="secondary-button" id="codex-cancel" type="button">关闭</button>
@@ -2437,6 +2504,7 @@
     const codexDialog = codexDialogLayer.querySelector(".codex-dialog");
     const codexForm = document.getElementById("codex-form");
     const codexCliStatus = document.getElementById("codex-cli-status");
+    const codexQuestionField = document.getElementById("codex-question-field");
     const codexQuestionInput = document.getElementById("codex-question-input");
     const codexError = document.getElementById("codex-error");
     const codexSubmitButton = document.getElementById("codex-submit");
@@ -2445,6 +2513,26 @@
     const codexResultTitle = document.getElementById("codex-result-title");
     const codexResultCommand = document.getElementById("codex-result-command");
     const codexRawResponse = document.getElementById("codex-raw-response");
+    const codexManualFields = document.getElementById("codex-manual-fields");
+    const codexManualTitleInput = document.getElementById("codex-manual-title-input");
+    const codexManualCommandInput = document.getElementById("codex-manual-command-input");
+    const codexManualDescriptionInput = document.getElementById("codex-manual-description-input");
+    const codexManualUsageInput = document.getElementById("codex-manual-usage-input");
+    const codexManualParametersInput = document.getElementById("codex-manual-parameters-input");
+    const codexManualOutputInput = document.getElementById("codex-manual-output-input");
+    const codexManualRiskInput = document.getElementById("codex-manual-risk-input");
+    const codexManualNotesInput = document.getElementById("codex-manual-notes-input");
+    /** 人工整理字段集中维护，便于切换生成批次时完整清空且不遗漏隐藏值。 */
+    const codexManualInputs = [
+      codexManualTitleInput,
+      codexManualCommandInput,
+      codexManualDescriptionInput,
+      codexManualUsageInput,
+      codexManualParametersInput,
+      codexManualOutputInput,
+      codexManualRiskInput,
+      codexManualNotesInput
+    ];
     const toast = document.getElementById("toast");
     const toastMessage = toast.querySelector("span");
 
@@ -2569,6 +2657,14 @@
         const description = line.slice(separatorIndex + 1).trim();
         return name && description ? { name, description } : null;
       }).filter(Boolean);
+    }
+
+    /**
+     * 清空上一批人工整理内容；只在开始新生成或明确放弃失败结果时调用。
+     * @returns {void}
+     */
+    function resetManualDraftFields() {
+      codexManualInputs.forEach((input) => { input.value = ""; });
     }
 
     /**
@@ -2730,16 +2826,26 @@
         : [codexState.statusMessage, codexState.version].filter(Boolean).join(" ");
       codexCliStatus.dataset.state = status;
       codexCliStatus.textContent = statusText;
+      const result = temporaryGenerationResult;
+      const isManualEntry = result?.status === "manualEntryRequired";
+      const hasRequiredManualFields = Boolean(
+        codexManualTitleInput.value.trim()
+        && codexManualCommandInput.value.trim()
+        && codexManualOutputInput.value.trim()
+      );
       codexDialog.setAttribute("aria-busy", String(codexState.generating));
-      codexQuestionInput.disabled = codexState.generating;
-      codexSubmitButton.disabled = codexState.checking
-        || !codexState.available
-        || codexState.generating
-        || !codexQuestionInput.value.trim();
-      codexSubmitButton.textContent = codexState.generating ? "生成中…" : "生成命令";
+      codexQuestionField.hidden = isManualEntry;
+      codexQuestionInput.disabled = codexState.generating || isManualEntry;
+      codexManualFields.hidden = !isManualEntry;
+      codexManualInputs.forEach((input) => { input.disabled = codexState.generating; });
+      codexSubmitButton.disabled = isManualEntry
+        ? codexState.generating || !hasRequiredManualFields
+        : codexState.checking || !codexState.available || codexState.generating || !codexQuestionInput.value.trim();
+      codexSubmitButton.textContent = codexState.generating
+        ? "生成中…"
+        : isManualEntry ? "展示临时结果" : "生成命令";
       codexError.textContent = codexState.error;
 
-      const result = temporaryGenerationResult;
       codexResultPreview.hidden = !result;
       codexResultTitle.hidden = result?.status !== "generated";
       codexResultCommand.hidden = result?.status !== "generated";
@@ -2750,7 +2856,7 @@
         codexResultCommand.textContent = result.draft?.command || "";
         codexRawResponse.textContent = "";
       } else if (result?.status === "manualEntryRequired") {
-        codexResultLabel.textContent = "两次响应都未通过格式校验";
+        codexResultLabel.textContent = "两次响应都未通过格式校验，请参考原文手动整理";
         codexResultTitle.textContent = "";
         codexResultCommand.textContent = "";
         codexRawResponse.textContent = result.rawResponse || "Codex 未返回可显示的内容。";
@@ -2781,11 +2887,17 @@
     }
 
     /**
-     * 关闭 Codex 对话框并恢复入口焦点；临时结果继续留在内存中供下一层主界面展示。
+     * 关闭 Codex 对话框并恢复入口焦点；有效临时结果继续保留，无效人工响应则明确放弃。
      * @returns {void}
      */
     function closeCodexDialog() {
       const returnTarget = codexReturnFocusTarget;
+      if (temporaryGenerationResult?.status === "manualEntryRequired") {
+        /* 关闭人工整理等同于放弃这次无效响应，保证下次打开时可以重新提问。 */
+        temporaryGenerationResult = null;
+        temporaryGenerationCategoryId = null;
+        resetManualDraftFields();
+      }
       codexDialogLayer.classList.remove("is-open");
       codexDialogLayer.setAttribute("aria-hidden", "true");
       codexState.error = "";
@@ -2847,6 +2959,7 @@
       codexState.error = "";
       temporaryGenerationResult = null;
       temporaryGenerationCategoryId = null;
+      resetManualDraftFields();
       renderWorkspace();
       renderCodexDialog();
       /* 对话框阻止背景分类切换，但仍显式捕获归属，避免异步结果依赖完成时的可变界面状态。 */
@@ -2865,6 +2978,8 @@
           showToastFeedback("Codex 临时命令已生成");
         } else if (result?.status === "manualEntryRequired") {
           temporaryGenerationResult = result;
+          temporaryGenerationCategoryId = generationCategoryId;
+          window.requestAnimationFrame(() => codexManualTitleInput.focus({ preventScroll: true }));
           showToastFeedback("Codex 返回内容需要手动整理", "error", 2600);
         } else {
           throw new Error("Codex 返回了无法识别的生成状态。");
@@ -2876,6 +2991,55 @@
         codexState.generating = false;
         renderCodexDialog();
       }
+    }
+
+    /**
+     * 校验人工整理字段并转换为与 Codex 成功响应相同的临时草稿，不创建持久化 ID 或触发保存。
+     * @returns {void}
+     */
+    function completeManualCommandDraft() {
+      if (temporaryGenerationResult?.status !== "manualEntryRequired" || !temporaryGenerationCategoryId) return;
+
+      const title = codexManualTitleInput.value.trim();
+      const command = codexManualCommandInput.value.trim();
+      const outputExample = codexManualOutputInput.value.trim();
+      if (!title || !command || !outputExample) {
+        codexState.error = "请填写任务标题、命令正文和参考输出。";
+        renderCodexDialog();
+        (!title ? codexManualTitleInput : !command ? codexManualCommandInput : codexManualOutputInput).focus();
+        return;
+      }
+
+      const parameterLines = codexManualParametersInput.value.split(/\r?\n/).filter((line) => line.trim());
+      const parameters = parseParameters(codexManualParametersInput.value);
+      if (parameters.length !== parameterLines.length) {
+        codexState.error = "参数说明请逐行使用“参数 = 说明”的格式。";
+        renderCodexDialog();
+        codexManualParametersInput.focus();
+        return;
+      }
+
+      temporaryGenerationResult = {
+        status: "generated",
+        draft: {
+          title,
+          command,
+          description: codexManualDescriptionInput.value.trim(),
+          usage: codexManualUsageInput.value.trim(),
+          parameters,
+          outputExample,
+          riskNote: codexManualRiskInput.value.trim(),
+          notes: codexManualNotesInput.value.trim()
+        }
+      };
+      temporaryCommandExpanded = true;
+      codexState.error = "";
+      renderWorkspace();
+      closeCodexDialog();
+      window.requestAnimationFrame(() => {
+        document.getElementById("temporary-command-card")?.scrollIntoView({ block: "start" });
+      });
+      showToastFeedback("人工整理的临时命令已生成");
     }
 
     /**
@@ -3542,9 +3706,14 @@
     document.getElementById("codex-cancel").addEventListener("click", closeCodexDialog);
     document.getElementById("codex-dialog-dismiss").addEventListener("click", closeCodexDialog);
     codexQuestionInput.addEventListener("input", renderCodexDialog);
+    codexManualInputs.forEach((input) => input.addEventListener("input", () => {
+      codexState.error = "";
+      renderCodexDialog();
+    }));
     codexForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      void requestCodexDraft();
+      if (temporaryGenerationResult?.status === "manualEntryRequired") completeManualCommandDraft();
+      else void requestCodexDraft();
     });
 
     /**
