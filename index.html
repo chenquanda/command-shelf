@@ -1,0 +1,2706 @@
+<!--
+  文件职责：提供“CommandShelf 常用命令看板”的完整桌面原型。
+  主要内容：固定分类导航、命令浏览与排序、复制反馈、分类新增及命令新增/编辑抽屉。
+  重要约束：单文件自包含；不接入搜索、AI 或命令执行能力；所有用户输入仅保存在当前页面内存中。
+-->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="CommandShelf 是一个本地优先、位置稳定的个人常用命令看板。">
+  <!-- 使用空数据图标，避免本地原型因默认 favicon 请求产生无意义的 404。 -->
+  <link rel="icon" href="data:,">
+  <title>CommandShelf</title>
+  <style>
+    /* 设计令牌：暖白画布、柔和鼠尾草色与克制的深色文字共同建立轻盈层级。 */
+    :root {
+      --bg: #F6F6F2;
+      --surface: #FEFEFC;
+      --sidebar: #EFF1EC;
+      --fg: #222825;
+      --muted: #68706B;
+      --quiet: #9AA19C;
+      --border: #E4E7E1;
+      --border-strong: #D6DBD3;
+      --accent: #6F8E80;
+      --accent-strong: #2F4A3F;
+      --accent-soft: #E5ECE7;
+      --code: #F0F2EE;
+      --code-fg: #26322D;
+      --code-muted: #36423D;
+      --danger: #93544D;
+      --danger-soft: #F7EBE8;
+      --focus: #53796A;
+      --font-ui: "Segoe UI Variable", "SF Pro Display", "Aptos", "PingFang SC", "Microsoft YaHei UI", sans-serif;
+      --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }    /* 基础布局：桌面视口完全铺满，不额外模拟浏览器或设备边框。 */
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--font-ui);
+      font-size: 15px;
+      line-height: 1.55;
+      text-rendering: optimizeLegibility;
+    }
+
+    button,
+    input,
+    textarea { font: inherit; }
+
+    button { color: inherit; }
+
+    button:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    .app-shell {
+      display: grid;
+      grid-template-columns: 256px minmax(0, 1fr);
+      width: 100vw;
+      height: 100vh;
+      min-width: 980px;
+      background: var(--surface);
+    }
+
+    /* 左侧分类栏：位置稳定，分隔而非卡片化。 */
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: var(--sidebar);
+      border-right: 1px solid var(--border-strong);
+    }
+
+    .brand {
+      min-height: 94px;
+      padding: 24px 22px 18px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand-mark {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 3px;
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .brand-glyph {
+      display: grid;
+      place-items: center;
+      width: 27px;
+      height: 27px;
+      border: 1px solid #606660;
+      border-radius: 6px;
+      background: #f4f3ef;
+    }
+
+    .brand-subtitle {
+      margin: 0 0 0 37px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.02em;
+    }
+
+    .category-nav {
+      flex: 1;
+      padding: 22px 14px;
+      overflow: auto;
+    }
+
+    .nav-label {
+      margin: 0 8px 10px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+    }
+
+    .category-list {
+      display: grid;
+      gap: 3px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .category-button {
+      display: grid;
+      grid-template-columns: 18px 1fr auto;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      min-height: 44px;
+      padding: 0 10px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      cursor: pointer;
+      text-align: left;
+      transition: background-color 120ms ease, border-color 120ms ease;
+    }
+
+    .category-button:hover { background: rgba(255, 255, 255, 0.48); }
+
+    .category-button[aria-current="page"] {
+      background: var(--accent-soft);
+      border-color: #c8d9d1;
+      color: #244d42;
+      font-weight: 600;
+    }
+
+    .category-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .category-count {
+      min-width: 22px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .category-button[aria-current="page"] .category-count { color: #356858; }
+
+    .sidebar-footer {
+      padding: 14px;
+      border-top: 1px solid var(--border);
+    }
+
+    .secondary-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 40px;
+      padding: 0 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: 7px;
+      background: transparent;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 550;
+      letter-spacing: 0.02em;
+      transition: background-color 120ms ease, border-color 120ms ease;
+    }
+
+    .secondary-button:hover { background: rgba(255, 255, 255, 0.55); border-color: #afb2ac; }
+    .sidebar-footer .secondary-button { width: 100%; }
+
+    /* 主内容区：标题信息与命令清单只有一个层级。 */
+    .workspace {
+      min-width: 0;
+      height: 100vh;
+      overflow-y: auto;
+      background: var(--surface);
+    }
+
+    .workspace-header {
+      position: sticky;
+      top: 0;
+      z-index: 4;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 32px;
+      min-height: 126px;
+      padding: 27px 42px 23px;
+      background: rgba(251, 254, 253, 0.97);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .heading-block { min-width: 0; }
+
+    .heading-row {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 5px;
+    }
+
+    .heading-row h1 {
+      margin: 0;
+      font-size: 32px;
+      font-weight: 600;
+      line-height: 1.15;
+      letter-spacing: -0.02em;
+    }
+
+    .header-count {
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .header-description {
+      margin: 0;
+      max-width: 62ch;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .primary-button {
+      display: inline-flex;
+      flex: 0 0 auto;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 42px;
+      margin-top: 3px;
+      padding: 0 15px;
+      border: 1px solid var(--fg);
+      border-radius: 7px;
+      background: var(--fg);
+      color: #f7f7f3;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      transition: background-color 120ms ease, transform 80ms ease;
+    }
+
+    .primary-button:hover { background: #303632; }
+    .primary-button:active { transform: translateY(1px); }
+    .primary-button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .command-list {
+      margin: 0;
+      padding: 0 42px 30px;
+      list-style: none;
+    }
+
+    .command-item {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr) auto;
+      gap: 14px;
+      padding: 21px 0 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .command-item.is-dragging { opacity: 0.45; }
+    .command-item.is-drag-over { border-top: 2px solid var(--accent); }
+
+    .drag-handle {
+      display: grid;
+      place-items: center;
+      width: 28px;
+      height: 36px;
+      margin-top: 1px;
+      border: 0;
+      background: transparent;
+      color: var(--quiet);
+      cursor: grab;
+    }
+
+    .drag-handle:active { cursor: grabbing; }
+    .command-main { min-width: 0; }
+
+    .command-heading {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 9px;
+      min-height: 24px;
+      margin-bottom: 9px;
+    }
+
+    .command-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0;
+    }
+
+    .risk-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 21px;
+      padding: 0 7px;
+      border: 1px solid #d8b8b2;
+      border-radius: 999px;
+      background: var(--danger-soft);
+      color: var(--danger);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+    }
+
+    .code-box {
+      display: flex;
+      align-items: center;
+      min-height: 46px;
+      padding: 11px 14px;
+      overflow-x: auto;
+      border: 1px solid #D3E4DF;
+      border-radius: 5px;
+      background: var(--code);
+      color: var(--code-fg);
+      font-family: var(--font-mono);
+      font-size: 14px;
+      line-height: 1.45;
+      white-space: nowrap;
+      tab-size: 2;
+    }
+
+    .command-note {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    /* 输出示例：默认收起并保持在条目内部，避免把清单扩张成二级页面。 */
+    .output-disclosure {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 32px;
+      margin-top: 8px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 550;
+      letter-spacing: 0.02em;
+    }
+
+    .output-disclosure:hover { color: var(--fg); }
+    .output-disclosure .icon { transition: transform 120ms ease; }
+    .output-disclosure.is-expanded .icon { transform: rotate(90deg); }
+
+    .output-example {
+      max-height: 188px;
+      margin: 4px 0 0;
+      padding: 11px 14px;
+      overflow: auto;
+      border: 1px solid #DDEAE6;
+      border-radius: 5px;
+      background: #F2F7F5;
+      color: var(--code-muted);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre;
+      tab-size: 2;
+    }
+
+    /* 输出面板将解释信息与终端文本分开，避免把说明误认为命令返回内容。 */
+    .output-panel { margin-top: 4px; }
+    .output-panel[hidden] { display: none; }
+
+    .output-panel-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 7px 2px 4px;
+    }
+
+    .output-panel-title {
+      color: var(--fg);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .output-panel-context {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .command-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 33px;
+    }
+
+    .action-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-height: 36px;
+      padding: 0 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--surface);
+      cursor: pointer;
+      color: #454b47;
+      font-size: 12px;
+      font-weight: 550;
+      letter-spacing: 0.02em;
+      transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+    }
+
+    .action-button:hover { background: #efefea; border-color: #aeb2ac; }
+    .action-button.is-copied { background: var(--accent-soft); border-color: #b6cfc3; color: #285a4c; }
+
+    .icon-only { width: 36px; padding: 0; }
+
+    .empty-state {
+      display: grid;
+      place-items: center;
+      min-height: 550px;
+      padding: 48px;
+      text-align: center;
+    }
+
+    .empty-state-inner { max-width: 370px; }
+    .empty-state h2 { margin: 0 0 7px; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+    .empty-state p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    /* 抽屉：使用轻量遮罩与细边界，确保新增和编辑流程明确但不喧宾夺主。 */
+    .drawer-layer {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: grid;
+      grid-template-columns: 1fr 438px;
+      visibility: hidden;
+      background: rgba(27, 31, 29, 0);
+      transition: background-color 150ms ease, visibility 0s linear 150ms;
+    }
+
+    .drawer-layer.is-open {
+      visibility: visible;
+      background: rgba(27, 31, 29, 0.2);
+      transition: background-color 150ms ease;
+    }
+
+    .drawer-dismiss { border: 0; background: transparent; cursor: default; }
+
+    .drawer {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: var(--surface);
+      border-left: 1px solid var(--border-strong);
+      transform: translateX(100%);
+      transition: transform 170ms ease;
+    }
+
+    .drawer-layer.is-open .drawer { transform: translateX(0); }
+
+    .drawer-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 26px 28px 21px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .drawer-header h2 { margin: 0 0 4px; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
+    .drawer-header p { margin: 0; color: var(--muted); font-size: 12px; }
+
+    .close-button {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: transparent;
+      cursor: pointer;
+    }
+
+    .close-button:hover { background: #efefea; }
+
+    .command-form {
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .form-body {
+      flex: 1;
+      padding: 24px 28px;
+      overflow-y: auto;
+    }
+
+    .field { display: grid; gap: 8px; margin-bottom: 21px; }
+
+    .field-label {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    .required { color: var(--danger); }
+
+    .text-input,
+    .text-area {
+      width: 100%;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--fg);
+      transition: border-color 120ms ease;
+    }
+
+    .text-input { height: 43px; padding: 0 12px; }
+    .text-area { min-height: 94px; padding: 11px 12px; resize: vertical; line-height: 1.55; }
+    .command-input { min-height: 112px; font-family: var(--font-mono); font-size: 13px; }
+    .text-input:hover, .text-area:hover { border-color: #a5aaa4; }
+
+    .field-hint { margin: -2px 0 0; color: var(--quiet); font-size: 11px; }
+
+    .risk-toggle {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 42px;
+      padding: 0 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #f6f5f1;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .risk-toggle input { width: 16px; height: 16px; margin: 0; accent-color: var(--danger); }
+
+    .form-error {
+      min-height: 22px;
+      margin: 0;
+      color: var(--danger);
+      font-size: 12px;
+    }
+
+    .drawer-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 17px 28px;
+      border-top: 1px solid var(--border);
+      background: #f6f5f1;
+    }
+
+    /* 反馈条：仅在复制成功时短暂出现，不长期占用界面。 */
+    .toast {
+      position: fixed;
+      right: 28px;
+      bottom: 28px;
+      z-index: 30;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 42px;
+      padding: 0 14px;
+      border: 1px solid #b8cec4;
+      border-radius: 7px;
+      background: #e7f0ec;
+      color: #285a4c;
+      font-size: 13px;
+      font-weight: 550;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(8px);
+      transition: opacity 120ms ease, transform 120ms ease;
+    }
+
+    .toast.is-visible { opacity: 1; transform: translateY(0); }
+
+    svg.icon {
+      display: block;
+      width: 16px;
+      height: 16px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    /* 浅色编辑式视觉系统：通过暖白表面、留白和细边框建立层级，避免重阴影与高饱和装饰。 */
+    html,
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-weight: 400;
+      letter-spacing: 0.005em;
+    }
+
+    * {
+      scrollbar-width: thin;
+      scrollbar-color: #B7BDB8 transparent;
+    }
+
+    *::-webkit-scrollbar { width: 8px; height: 8px; }
+    *::-webkit-scrollbar-track { background: transparent; }
+    *::-webkit-scrollbar-thumb {
+      border: 2px solid transparent;
+      border-radius: 8px;
+      background: #B7BDB8;
+      background-clip: padding-box;
+    }
+
+    .app-shell {
+      grid-template-columns: 272px minmax(0, 1fr);
+      background: var(--bg);
+    }
+
+    .sidebar {
+      background: var(--sidebar);
+      border-right-color: #DEE2DB;
+    }
+
+    .brand {
+      min-height: 108px;
+      padding: 28px 24px 22px;
+      border-bottom-color: #DFE3DC;
+    }
+
+    .brand-mark {
+      margin-bottom: 5px;
+      color: #25302B;
+      font-size: 16px;
+      font-weight: 680;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-subtitle {
+      margin-left: 39px;
+      color: #666F69;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+    }
+
+    .brand-glyph {
+      width: 29px;
+      height: 29px;
+      border-color: #CFD9D1;
+      border-radius: 7px;
+      background: #DDE7E0;
+      color: #345348;
+    }
+
+    .category-nav { padding: 26px 16px; }
+
+    .nav-label {
+      margin: 0 9px 12px;
+      color: #626B65;
+      font-size: 10px;
+      font-weight: 650;
+      letter-spacing: 0.12em;
+    }
+
+    .category-list { gap: 5px; }
+
+    .category-button {
+      min-height: 44px;
+      padding: 0 12px;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      color: #59615C;
+      font-size: 13px;
+      transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease, transform 150ms ease;
+    }
+
+    .category-button:hover {
+      border-color: #E0E4DD;
+      background: rgba(255, 255, 253, 0.7);
+      color: #2C3531;
+      transform: translateX(2px);
+    }
+
+    .category-button[aria-current="page"] {
+      border-color: #D8DFD8;
+      background: rgba(255, 255, 253, 0.92);
+      color: #29443A;
+      font-weight: 660;
+      box-shadow: 0 8px 24px rgba(54, 69, 61, 0.035);
+    }
+
+    .category-button[aria-current="page"] .category-count {
+      background: #E5ECE7;
+      color: #3E5E51;
+    }
+
+    .category-count {
+      display: grid;
+      place-items: center;
+      min-width: 24px;
+      height: 22px;
+      padding: 0 5px;
+      border-radius: 999px;
+      color: #7D8580;
+      font-size: 11px;
+    }
+
+    .sidebar-footer {
+      padding: 18px 16px;
+      border-top-color: #DFE3DC;
+      background: rgba(245, 246, 242, 0.56);
+    }
+
+    .secondary-button {
+      min-height: 42px;
+      border-color: #D4DAD3;
+      border-radius: 7px;
+      background: rgba(255, 255, 253, 0.78);
+      color: #3C4541;
+      font-weight: 620;
+    }
+
+    .secondary-button:hover {
+      border-color: #AEB8B0;
+      background: #FEFEFC;
+      color: #27302C;
+    }
+
+    .workspace { background: var(--bg); }
+
+    .workspace-header {
+      min-height: 142px;
+      padding: 36px 54px 28px;
+      border-bottom-color: rgba(216, 221, 213, 0.88);
+      background: rgba(246, 246, 242, 0.94);
+      backdrop-filter: blur(16px);
+    }
+
+    .heading-row h1 {
+      color: #222A26;
+      font-size: 36px;
+      font-weight: 680;
+      letter-spacing: -0.045em;
+    }
+
+    .header-count {
+      padding: 3px 8px;
+      border: 1px solid #DFE4DD;
+      border-radius: 999px;
+      background: rgba(255, 255, 253, 0.72);
+      color: #68716B;
+      font-size: 11px;
+    }
+
+    .header-description {
+      margin-top: 8px;
+      color: #6B736E;
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    .primary-button {
+      min-height: 44px;
+      padding: 0 17px;
+      border-color: #31473E;
+      border-radius: 7px;
+      background: #31473E;
+      color: #FAFBF8;
+      font-weight: 640;
+      transition: background-color 150ms ease, border-color 150ms ease, transform 100ms ease;
+    }
+
+    .primary-button:hover {
+      border-color: #405B50;
+      background: #405B50;
+    }
+
+    .command-list {
+      display: grid;
+      gap: 14px;
+      max-width: 1200px;
+      padding: 28px 54px 48px;
+    }
+
+    .command-item {
+      grid-template-columns: 24px minmax(0, 1fr) auto;
+      gap: 14px;
+      padding: 22px 22px 21px 17px;
+      border: 1px solid #E1E5DE;
+      border-radius: 12px;
+      background: rgba(255, 255, 253, 0.88);
+      box-shadow: 0 12px 36px rgba(50, 62, 55, 0.028);
+      animation: command-enter 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+
+    .command-item:nth-child(2) { animation-delay: 45ms; }
+    .command-item:nth-child(3) { animation-delay: 90ms; }
+    .command-item:nth-child(4) { animation-delay: 135ms; }
+    .command-item:nth-child(5) { animation-delay: 180ms; }
+
+    .command-item:hover {
+      border-color: #D2D9D1;
+      box-shadow: 0 14px 40px rgba(50, 62, 55, 0.045);
+    }
+
+    .command-item.is-drag-over {
+      border-top: 2px solid #739586;
+      background: #F8FAF6;
+    }
+
+    .command-title {
+      color: #29312D;
+      font-size: 14px;
+      font-weight: 660;
+      letter-spacing: -0.01em;
+    }
+
+    .drag-handle {
+      width: 24px;
+      color: #B4BAB5;
+    }
+
+    .drag-handle:hover { color: #66706A; }
+
+    .risk-badge {
+      border-color: #E9D2CE;
+      background: var(--danger-soft);
+      color: #88504A;
+    }
+
+    .code-box {
+      min-height: 46px;
+      padding: 12px 14px;
+      border-color: #E0E4DE;
+      border-radius: 8px;
+      background: var(--code);
+      color: var(--code-fg);
+      font-size: 13px;
+      font-weight: 560;
+    }
+
+    .command-note {
+      margin-top: 10px;
+      color: #6B736E;
+      font-size: 12px;
+      line-height: 1.65;
+    }
+
+    .output-disclosure {
+      margin-top: 10px;
+      color: #557568;
+      font-weight: 620;
+      transition: color 150ms ease;
+    }
+
+    .output-disclosure:hover { color: #2F4A3F; }
+
+    .output-panel-heading { padding: 11px 3px 6px; }
+    .output-panel-title { color: #35413B; font-weight: 650; }
+    .output-panel-context { color: #68716B; }
+
+    .output-example {
+      margin-top: 4px;
+      border-color: #DEE4DE;
+      border-radius: 8px;
+      background: #F7F8F5;
+      color: #46514C;
+      line-height: 1.65;
+    }
+
+    .command-actions { margin-top: 32px; }
+
+    .action-button {
+      min-height: 34px;
+      border-color: #DDE1DC;
+      border-radius: 7px;
+      background: #FAFAF7;
+      color: #59625D;
+      font-weight: 610;
+    }
+
+    .action-button:hover {
+      border-color: #BBC4BC;
+      background: #F1F4EF;
+      color: #2D3833;
+    }
+
+    .action-button.is-copied {
+      border-color: #BFD2C7;
+      background: #E8EFEA;
+      color: #31594A;
+    }
+
+    .empty-state {
+      margin: 28px 54px;
+      min-height: 460px;
+      border: 1px dashed #D6DCD4;
+      border-radius: 12px;
+      background: rgba(255, 255, 253, 0.62);
+    }
+
+    .empty-state[hidden] { display: none; }
+
+    .empty-state h2 { color: #323C37; font-weight: 660; }
+
+    .drawer-layer.is-open { background: rgba(40, 47, 43, 0.18); }
+
+    .drawer {
+      margin: 10px 10px 10px 0;
+      border: 1px solid #D8DDD6;
+      border-radius: 12px;
+      background: #FEFEFC;
+      box-shadow: 0 24px 72px rgba(38, 49, 43, 0.045);
+    }
+
+    .drawer-header {
+      padding: 28px 28px 22px;
+      border-bottom-color: #E7EAE4;
+    }
+
+    .drawer-header h2 {
+      color: #29322E;
+      font-size: 24px;
+      font-weight: 670;
+      letter-spacing: -0.035em;
+    }
+
+    .drawer-header p { color: #747D77; }
+
+    .close-button {
+      border-color: #DEE3DC;
+      border-radius: 7px;
+      background: #FAFAF7;
+      color: #59615C;
+    }
+
+    .close-button:hover { background: #EFF3EE; color: #2E3833; }
+
+    .form-body { padding: 26px 28px; }
+
+    .text-input,
+    .text-area {
+      border-color: #D6DBD4;
+      border-radius: 8px;
+      background: #FBFBF8;
+      color: #2B332F;
+    }
+
+    .text-input::placeholder,
+    .text-area::placeholder { color: #A1A7A2; }
+
+    .text-input:hover,
+    .text-area:hover { border-color: #ADB7AF; }
+
+    .text-input:focus-visible,
+    .text-area:focus-visible {
+      border-color: #769486;
+      outline-color: rgba(83, 121, 106, 0.28);
+    }
+
+    .field-label { color: #37413C; font-weight: 650; }
+    .field-hint { color: #878F89; }
+
+    .risk-toggle {
+      border-color: #E9D9D5;
+      border-radius: 8px;
+      background: #FBF3F1;
+      color: #6C4B46;
+    }
+
+    .drawer-footer {
+      border-top-color: #E4E8E2;
+      background: #F5F6F2;
+    }
+
+    .toast {
+      border-color: #31473E;
+      border-radius: 8px;
+      background: #31473E;
+      color: #FAFBF8;
+    }
+
+    svg.icon { stroke-width: 1.8; }
+
+    /* 条目只在进入视图时轻微上浮，帮助建立阅读节奏且不改变布局。 */
+    @keyframes command-enter {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 1120px) {
+      .app-shell { grid-template-columns: 240px minmax(0, 1fr); }
+      .workspace-header { padding-right: 36px; padding-left: 36px; }
+      .command-list { padding-right: 36px; padding-left: 36px; }
+      .command-item { padding-right: 18px; }
+    }
+
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
+    }
+  </style>
+  <style>
+    /* 纸感精密目录：以连续清单、编辑式排版和低饱和橄榄色复现已确认的视觉方案。 */
+    :root {
+      --paper-canvas: #F3F0E8;
+      --paper-surface: #F8F5EE;
+      --paper-raised: #FBF8F1;
+      --paper-code: #F1EEE6;
+      --ink: #22251F;
+      --ink-soft: #565B52;
+      --ink-quiet: #7B8177;
+      --olive: #59643D;
+      --olive-soft: #E8E8D9;
+      --paper-line: #D9D3C6;
+      --paper-line-strong: #C9C1B2;
+      --paper-danger: #8C4F46;
+      --paper-danger-soft: #F3E6E1;
+      --font-display: Georgia, "Noto Serif SC", "Songti SC", "STSong", serif;
+      --font-ui: "Segoe UI Variable", "Aptos", "PingFang SC", "Microsoft YaHei UI", sans-serif;
+      --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+    }
+
+    html,
+    body {
+      background: var(--paper-canvas);
+      color: var(--ink);
+      font-family: var(--font-ui);
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    .app-shell {
+      grid-template-columns: 288px minmax(0, 1fr);
+      background: var(--paper-canvas);
+    }
+
+    .sidebar {
+      min-height: 0;
+      overflow: hidden;
+      background: var(--paper-surface);
+      border-right: 1px solid var(--paper-line);
+    }
+
+    .brand {
+      min-height: 142px;
+      padding: 38px 36px 28px;
+      border-bottom: 0;
+    }
+
+    .brand-mark {
+      display: block;
+      margin: 0 0 8px;
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 25px;
+      font-weight: 500;
+      letter-spacing: -0.025em;
+    }
+
+    .brand-glyph { display: none; }
+
+    .brand-subtitle {
+      margin: 0;
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 14px;
+      letter-spacing: 0.08em;
+    }
+
+    .category-nav {
+      min-height: 0;
+      padding: 20px 20px 24px;
+    }
+
+    .nav-label {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin: 0 16px 22px;
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+    }
+
+    .nav-label::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: var(--paper-line-strong);
+    }
+
+    .category-list { gap: 2px; }
+
+    .category-button {
+      position: relative;
+      grid-template-columns: minmax(0, 1fr) auto;
+      min-height: 56px;
+      padding: 0 16px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 16px;
+      transition: color 140ms ease, background-color 140ms ease;
+    }
+
+    .category-button::before {
+      content: "";
+      position: absolute;
+      top: 12px;
+      bottom: 12px;
+      left: 0;
+      width: 3px;
+      background: transparent;
+    }
+
+    .category-button:hover {
+      border: 0;
+      background: rgba(89, 100, 61, 0.045);
+      color: var(--ink);
+      transform: none;
+    }
+
+    .category-button[aria-current="page"] {
+      border: 0;
+      background: transparent;
+      color: var(--ink);
+      font-weight: 600;
+      box-shadow: none;
+    }
+
+    .category-button[aria-current="page"]::before { background: var(--olive); }
+    .category-button .icon { display: none; }
+
+    .category-name {
+      overflow: visible;
+      text-overflow: clip;
+      white-space: nowrap;
+    }
+
+    .category-count,
+    .category-button[aria-current="page"] .category-count {
+      display: block;
+      min-width: 0;
+      height: auto;
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .sidebar-footer {
+      flex: 0 0 auto;
+      padding: 20px 36px 36px;
+      border-top: 0;
+      background: transparent;
+    }
+
+    .sidebar-footer .secondary-button {
+      justify-content: flex-start;
+      width: auto;
+      min-height: 40px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--olive);
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .sidebar-footer .secondary-button:hover {
+      border: 0;
+      background: transparent;
+      color: #353D24;
+    }
+
+    .sidebar-footer .secondary-button:disabled {
+      cursor: not-allowed;
+      opacity: 0.4;
+    }
+
+    /* 数据同步入口固定在侧栏底部，保持全局可见但不抢占命令浏览的主层级。 */
+    .sync-panel {
+      flex: 0 0 auto;
+      margin: 0 36px;
+      padding: 20px 0 18px;
+      border-top: 1px solid var(--paper-line);
+    }
+
+    .sync-panel-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .sync-panel-title {
+      margin: 0;
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+    }
+
+    .repository-button {
+      max-width: 132px;
+      padding: 2px 0;
+      overflow: hidden;
+      border: 0;
+      border-bottom: 1px solid transparent;
+      background: transparent;
+      color: var(--ink-soft);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .repository-button:hover,
+    .repository-button:focus-visible {
+      border-bottom-color: var(--olive);
+      color: var(--olive);
+      outline: 0;
+    }
+
+    .repository-button:disabled {
+      cursor: wait;
+      opacity: 0.55;
+    }
+
+    .sync-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 22px;
+      margin: 0;
+      color: var(--ink-soft);
+      font-size: 12px;
+    }
+
+    .sync-status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #78815f;
+      box-shadow: 0 0 0 3px rgba(120, 129, 95, 0.12);
+    }
+
+    .sync-status[data-state="dirty"] .sync-status-dot {
+      background: #9b7a42;
+      box-shadow: 0 0 0 3px rgba(155, 122, 66, 0.13);
+    }
+
+    .sync-status[data-state="syncing"] .sync-status-dot {
+      background: #66748b;
+      box-shadow: 0 0 0 3px rgba(102, 116, 139, 0.13);
+      animation: sync-pulse 900ms ease-in-out infinite alternate;
+    }
+
+    .sync-status[data-state="error"] {
+      color: var(--paper-danger);
+    }
+
+    .sync-status[data-state="error"] .sync-status-dot {
+      background: var(--paper-danger);
+      box-shadow: 0 0 0 3px rgba(140, 79, 70, 0.13);
+    }
+
+    .sync-status[data-state="unconfigured"] .sync-status-dot {
+      background: #8b8b82;
+      box-shadow: 0 0 0 3px rgba(139, 139, 130, 0.12);
+    }
+
+    .sync-meta {
+      min-height: 32px;
+      margin: 4px 0 12px 15px;
+      color: #6b7168;
+      font-size: 10px;
+      line-height: 1.55;
+    }
+
+    .sync-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .sync-action-button {
+      min-height: 34px;
+      padding: 0 10px;
+      border: 1px solid var(--paper-line-strong);
+      border-radius: 4px;
+      background: transparent;
+      color: var(--ink-soft);
+      cursor: pointer;
+      font-family: var(--font-display);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .sync-action-button:hover:not(:disabled) {
+      border-color: var(--olive);
+      background: var(--olive-soft);
+      color: var(--olive);
+    }
+
+    .sync-action-button:disabled {
+      cursor: not-allowed;
+      opacity: 0.42;
+    }
+
+    .command-list[data-readonly="true"] .drag-handle,
+    .command-list[data-readonly="true"] .edit-button {
+      cursor: not-allowed;
+      opacity: 0.38;
+    }
+
+    @keyframes sync-pulse {
+      from { opacity: 0.48; }
+      to { opacity: 1; }
+    }
+
+    .workspace { background: var(--paper-canvas); }
+
+    .workspace-header {
+      position: sticky;
+      min-height: 170px;
+      padding: 46px 40px 32px 46px;
+      border-bottom: 1px solid var(--paper-line);
+      background: rgba(243, 240, 232, 0.97);
+      backdrop-filter: blur(10px);
+    }
+
+    .heading-row { gap: 18px; margin-bottom: 8px; }
+
+    .heading-row h1 {
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 52px;
+      font-weight: 500;
+      line-height: 1;
+      letter-spacing: -0.045em;
+    }
+
+    .header-count {
+      padding: 7px 12px;
+      border: 1px solid var(--paper-line-strong);
+      border-radius: 7px;
+      background: var(--paper-surface);
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 13px;
+    }
+
+    .header-description {
+      margin-top: 10px;
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 13px;
+    }
+
+    .primary-button {
+      min-width: 160px;
+      min-height: 50px;
+      margin-top: 8px;
+      padding: 0 20px;
+      border: 1px solid var(--olive);
+      border-radius: 5px;
+      background: transparent;
+      color: var(--olive);
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .primary-button:hover {
+      border-color: var(--olive);
+      background: var(--olive);
+      color: var(--paper-raised);
+    }
+
+    .command-list {
+      display: block;
+      max-width: none;
+      margin: 28px 40px 48px 30px;
+      padding: 0;
+      overflow: hidden;
+      border: 1px solid var(--paper-line);
+      border-radius: 5px;
+      background: var(--paper-surface);
+      box-shadow: none;
+    }
+
+    .command-item {
+      display: block;
+      padding: 0;
+      border: 0;
+      border-bottom: 1px solid var(--paper-line);
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+      animation: none;
+    }
+
+    .command-item:last-child { border-bottom: 0; }
+    .command-item:hover { border-color: var(--paper-line); box-shadow: none; }
+
+    .command-item.is-dragging { opacity: 0.48; }
+    .command-item.is-drag-over { border-top: 2px solid var(--olive); }
+
+    .command-header {
+      display: grid;
+      grid-template-columns: 34px 46px minmax(190px, 0.7fr) minmax(300px, 1.8fr) auto;
+      align-items: center;
+      gap: 10px;
+      min-height: 76px;
+      padding: 0 20px 0 18px;
+    }
+
+    .command-toggle,
+    .drag-handle {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 40px;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--ink);
+      cursor: pointer;
+    }
+
+    .command-toggle .icon { transition: transform 150ms ease; }
+    .command-toggle[aria-expanded="true"] .icon { transform: rotate(90deg); }
+
+    .drag-handle {
+      width: 46px;
+      color: var(--olive);
+      cursor: grab;
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .drag-handle:active { cursor: grabbing; }
+
+    .command-heading { display: block; min-width: 0; margin: 0; }
+
+    .command-title {
+      overflow: hidden;
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 16px;
+      font-weight: 600;
+      line-height: 1.35;
+      letter-spacing: 0.01em;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .risk-badge { margin-left: 8px; }
+
+    .code-box {
+      min-width: 0;
+      min-height: 46px;
+      padding: 12px 14px;
+      border: 1px solid #DED8CC;
+      border-radius: 4px;
+      background: var(--paper-code);
+      color: #2B302A;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .command-actions { margin: 0; }
+
+    .action-button {
+      min-width: 38px;
+      min-height: 38px;
+      padding: 0 10px;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--ink-soft);
+    }
+
+    .action-button:hover {
+      border-color: var(--paper-line);
+      background: var(--paper-code);
+      color: var(--ink);
+    }
+
+    .action-button.is-copied {
+      border-color: #C9CCB2;
+      background: var(--olive-soft);
+      color: var(--olive);
+    }
+
+    .command-detail {
+      display: grid;
+      grid-template-columns: minmax(260px, 34%) minmax(0, 66%);
+      min-height: 540px;
+      border-top: 1px solid var(--paper-line);
+    }
+
+    .command-detail[hidden] { display: none; }
+
+    .detail-column {
+      min-width: 0;
+      padding: 28px;
+    }
+
+    .detail-column + .detail-column { border-left: 1px solid var(--paper-line); }
+
+    .detail-section + .detail-section {
+      margin-top: 24px;
+      padding-top: 24px;
+      border-top: 1px solid var(--paper-line);
+    }
+
+    .detail-label {
+      margin: 0 0 12px;
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+    }
+
+    .detail-description {
+      margin: 0;
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 13px;
+      line-height: 1.8;
+    }
+
+    .usage-box {
+      display: flex;
+      align-items: center;
+      min-height: 46px;
+      padding: 0 14px;
+      overflow-x: auto;
+      border: 1px solid var(--paper-line);
+      border-radius: 4px;
+      background: var(--paper-code);
+      color: var(--ink);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .parameter-list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .parameter-item {
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      color: var(--ink-soft);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .parameter-name {
+      display: grid;
+      place-items: center;
+      min-height: 30px;
+      padding: 0 6px;
+      border: 1px solid var(--paper-line);
+      border-radius: 4px;
+      background: var(--paper-code);
+      color: var(--ink);
+      font-family: var(--font-mono);
+    }
+
+    .parameter-empty { color: var(--ink-quiet); font-size: 12px; }
+
+    .output-column {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .output-example {
+      flex: 1;
+      max-height: 310px;
+      margin: 0;
+      padding: 18px;
+      border: 1px solid var(--paper-line);
+      border-radius: 4px;
+      background: var(--paper-code);
+      color: #343932;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .output-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 14px;
+      /* 小字号辅助文本提高对比度，确保纸色背景下仍满足可读性要求。 */
+      color: #62685f;
+      font-size: 11px;
+    }
+
+    .copy-output-button { flex: 0 0 auto; min-width: auto; }
+
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .empty-state {
+      margin: 28px 40px 48px 30px;
+      min-height: 520px;
+      border: 1px dashed var(--paper-line-strong);
+      border-radius: 5px;
+      background: var(--paper-surface);
+    }
+
+    .empty-state h2 {
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-weight: 600;
+    }
+
+    .drawer {
+      border-color: var(--paper-line);
+      background: var(--paper-raised);
+      box-shadow: 0 24px 72px rgba(54, 48, 38, 0.045);
+    }
+
+    .drawer-header,
+    .drawer-footer { border-color: var(--paper-line); }
+
+    .drawer-header h2 {
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-weight: 600;
+    }
+
+    .drawer-footer { background: var(--paper-surface); }
+
+    /* 仓库设置使用独立轻量对话框，避免把机器路径混入命令编辑表单。 */
+    .repository-dialog-layer {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      display: none;
+      place-items: center;
+      padding: 20px;
+      background: rgba(54, 48, 38, 0.18);
+    }
+
+    .repository-dialog-layer.is-open { display: grid; }
+
+    .repository-dialog-dismiss {
+      position: absolute;
+      inset: 0;
+      border: 0;
+      background: transparent;
+      cursor: default;
+    }
+
+    .repository-dialog {
+      position: relative;
+      width: min(460px, calc(100vw - 40px));
+      padding: 28px;
+      border: 1px solid var(--paper-line-strong);
+      border-radius: 6px;
+      background: var(--paper-raised);
+      box-shadow: 0 24px 72px rgba(54, 48, 38, 0.08);
+    }
+
+    .repository-dialog h2 {
+      margin: 0 0 8px;
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 24px;
+      font-weight: 600;
+    }
+
+    .repository-dialog-description {
+      margin: 0 0 24px;
+      color: var(--ink-soft);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .repository-dialog .field { gap: 8px; }
+
+    .repository-dialog-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .repository-dialog-footer .primary-button,
+    .repository-dialog-footer .secondary-button {
+      min-width: 112px;
+      min-height: 42px;
+      margin: 0;
+    }
+
+    .repository-dialog-footer .secondary-button {
+      border-color: var(--paper-line-strong);
+      background: transparent;
+    }
+
+    .text-input,
+    .text-area {
+      border-color: var(--paper-line-strong);
+      background: var(--paper-surface);
+      color: var(--ink);
+    }
+
+    .text-input:focus-visible,
+    .text-area:focus-visible {
+      border-color: var(--olive);
+      outline-color: rgba(89, 100, 61, 0.25);
+    }
+
+    .risk-toggle {
+      border-color: #DFC9C2;
+      background: var(--paper-danger-soft);
+      color: #68443E;
+    }
+
+    .toast {
+      border-color: var(--olive);
+      background: var(--olive);
+      color: var(--paper-raised);
+    }
+
+    .toast[data-tone="error"] {
+      border-color: var(--paper-danger);
+      background: var(--paper-danger);
+    }
+
+    @media (max-width: 1180px) {
+      .app-shell { grid-template-columns: 250px minmax(0, 1fr); }
+      .brand { padding-right: 28px; padding-left: 28px; }
+      .sync-panel { margin-right: 28px; margin-left: 28px; }
+      .workspace-header { padding-left: 34px; }
+      .command-list,
+      .empty-state { margin-right: 28px; margin-left: 16px; }
+      .command-header { grid-template-columns: 30px 38px minmax(160px, 0.8fr) minmax(240px, 1.3fr) auto; padding-right: 14px; }
+      .command-detail { grid-template-columns: minmax(245px, 38%) minmax(0, 62%); }
+      .detail-column { padding: 22px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .command-toggle .icon { transition: none; }
+      .sync-status[data-state="syncing"] .sync-status-dot { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <!-- 内联轻量线性图标保证单文件离线可预览，并通过统一描边保持柔和一致。 -->
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute">
+    <symbol id="icon-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></symbol>
+    <symbol id="icon-box" viewBox="0 0 24 24"><path d="m21 8-9-5-9 5 9 5 9-5Z"/><path d="m3 8 9 5v8"/><path d="m21 8-9 5"/></symbol>
+    <symbol id="icon-git" viewBox="0 0 24 24"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 9v6a3 3 0 0 0 3 3"/><path d="M18 6.5a3 3 0 1 0-3 3c0 2-1 3-3 3"/></symbol>
+    <symbol id="icon-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8"/><path d="m18 5 2 2"/><path d="m15 8 2 2"/></symbol>
+    <symbol id="icon-network" viewBox="0 0 24 24"><rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="15" width="6" height="6" rx="1"/><path d="M9 6h3a3 3 0 0 1 3 3v6"/></symbol>
+    <symbol id="icon-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="icon-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></symbol>
+    <symbol id="icon-grip" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="icon-x" viewBox="0 0 24 24"><path d="m18 6-12 12M6 6l12 12"/></symbol>
+  </svg>
+
+  <main class="app-shell" data-od-id="command-board-app">
+    <aside class="sidebar" data-od-id="category-sidebar" aria-label="命令分类">
+      <header class="brand" data-od-id="product-brand">
+        <p class="brand-mark"><span class="brand-glyph"><svg class="icon" aria-hidden="true"><use href="#icon-terminal"></use></svg></span>CommandShelf</p>
+        <p class="brand-subtitle">个人命令记忆板</p>
+      </header>
+      <nav class="category-nav" data-od-id="category-navigation" aria-label="分类列表">
+        <p class="nav-label">分类目录</p>
+        <ul class="category-list" id="category-list"></ul>
+      </nav>
+      <section class="sync-panel" id="sync-panel" aria-labelledby="sync-panel-title" aria-busy="false">
+        <div class="sync-panel-heading">
+          <h2 class="sync-panel-title" id="sync-panel-title">数据同步</h2>
+          <button class="repository-button" id="repository-button" type="button" title="更换本地数据仓库">command-data</button>
+        </div>
+        <p class="sync-status" id="sync-status" data-state="synced" role="status" aria-live="polite">
+          <span class="sync-status-dot" aria-hidden="true"></span>
+          <span id="sync-status-label">已同步</span>
+        </p>
+        <p class="sync-meta" id="sync-meta">上次同步：刚刚</p>
+        <div class="sync-actions" aria-label="GitHub 同步操作">
+          <button class="sync-action-button" id="pull-button" type="button">拉取</button>
+          <button class="sync-action-button" id="push-button" type="button" disabled>推送</button>
+        </div>
+      </section>
+      <footer class="sidebar-footer" data-od-id="sidebar-actions">
+        <button class="secondary-button" id="add-category-button" type="button" data-od-id="add-category-button">
+          <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>添加分类
+        </button>
+      </footer>
+    </aside>
+
+    <section class="workspace" data-od-id="command-workspace" aria-live="polite">
+      <header class="workspace-header" data-od-id="workspace-header">
+        <div class="heading-block">
+          <div class="heading-row">
+            <h1 id="category-title" data-od-id="category-title">Docker</h1>
+            <span class="header-count" id="category-count">5 条命令</span>
+          </div>
+          <p class="header-description" id="category-description">容器日常查看、排障和清理时最常用的一组命令。</p>
+        </div>
+        <button class="primary-button" id="add-command-button" type="button" data-od-id="add-command-button">
+          <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>添加命令
+        </button>
+      </header>
+      <ol class="command-list" id="command-list" data-od-id="command-list"></ol>
+      <section class="empty-state" id="empty-state" data-od-id="empty-category-state" hidden>
+        <div class="empty-state-inner">
+          <h2>这个分类还没有命令</h2>
+          <p>点击右上角“添加命令”，把第一条需要长期保留的命令放进来。</p>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="drawer-layer" id="drawer-layer" aria-hidden="true">
+    <button class="drawer-dismiss" id="drawer-dismiss" type="button" tabindex="-1" aria-label="关闭命令编辑"></button>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" data-od-id="command-drawer">
+      <header class="drawer-header">
+        <div>
+          <h2 id="drawer-title">添加命令</h2>
+          <p id="drawer-context">保存到 Docker 分类</p>
+        </div>
+        <button class="close-button" id="drawer-close" type="button" aria-label="关闭" data-od-id="drawer-close-button">
+          <svg class="icon" aria-hidden="true"><use href="#icon-x"></use></svg>
+        </button>
+      </header>
+      <form class="command-form" id="command-form" novalidate>
+        <div class="form-body">
+          <label class="field">
+            <span class="field-label">任务标题 <span class="required">*</span></span>
+            <input class="text-input" id="command-title-input" name="title" type="text" maxlength="40" autocomplete="off" placeholder="例如：查看容器端口映射" required data-od-id="command-title-input">
+          </label>
+          <label class="field">
+            <span class="field-label">命令正文 <span class="required">*</span></span>
+            <textarea class="text-area command-input" id="command-code-input" name="code" spellcheck="false" placeholder="docker port &lt;container&gt;" required data-od-id="command-code-input"></textarea>
+            <span class="field-hint">保留需要手动替换的参数占位符，例如 &lt;container&gt;。</span>
+          </label>
+          <label class="field">
+            <span class="field-label">用途说明</span>
+            <textarea class="text-area" id="command-note-input" name="note" maxlength="120" placeholder="说明参数含义、适用场景或使用前提。" data-od-id="command-note-input"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-label">参数说明</span>
+            <textarea class="text-area command-input" id="command-params-input" name="parameters" maxlength="1000" spellcheck="false" placeholder="每行一个参数，例如：&#10;a = 显示终端上的所有进程&#10;u = 以用户为中心的格式显示详细信息" data-od-id="command-params-input"></textarea>
+            <span class="field-hint">使用“参数 = 说明”的格式；没有额外参数时可以留空。</span>
+          </label>
+          <label class="field">
+            <span class="field-label">输出示例 <span class="required">*</span></span>
+            <textarea class="text-area command-input" id="command-output-input" name="outputExample" maxlength="1800" spellcheck="false" placeholder="粘贴一段可信的典型输出，帮助下次快速确认命令是否符合预期。" required data-od-id="command-output-input"></textarea>
+            <span class="field-hint">仅用于查看，不会提供复制或执行入口。</span>
+          </label>
+          <label class="risk-toggle">
+            <input id="command-risk-input" name="risk" type="checkbox">
+            <span>标记为需要谨慎执行的命令</span>
+          </label>
+          <p class="form-error" id="form-error" role="alert"></p>
+        </div>
+        <footer class="drawer-footer">
+          <button class="secondary-button" id="drawer-cancel" type="button" data-od-id="drawer-cancel-button">取消</button>
+          <button class="primary-button" id="drawer-save" type="submit" data-od-id="drawer-save-button">保存命令</button>
+        </footer>
+      </form>
+    </aside>
+  </div>
+
+  <div class="repository-dialog-layer" id="repository-dialog-layer" aria-hidden="true">
+    <button class="repository-dialog-dismiss" id="repository-dialog-dismiss" type="button" tabindex="-1" aria-label="关闭数据仓库设置"></button>
+    <section class="repository-dialog" role="dialog" aria-modal="true" aria-labelledby="repository-dialog-title">
+      <form id="repository-form" novalidate>
+        <h2 id="repository-dialog-title">数据仓库</h2>
+        <p class="repository-dialog-description">选择已经克隆到本机的个人 Git 仓库。CommandShelf 只读写其中的 commands.json，不管理 GitHub 账号。</p>
+        <label class="field">
+          <span class="field-label">本地仓库路径 <span class="required">*</span></span>
+          <input class="text-input" id="repository-path-input" name="repositoryPath" type="text" spellcheck="false" autocomplete="off" placeholder="例如：D:\\CommandShelf\\command-data" required>
+          <span class="field-hint">该路径只保存在当前电脑，不会写入同步数据。</span>
+        </label>
+        <p class="form-error" id="repository-error" role="alert"></p>
+        <footer class="repository-dialog-footer">
+          <button class="secondary-button" id="repository-cancel" type="button">取消</button>
+          <button class="primary-button" type="submit">使用此仓库</button>
+        </footer>
+      </form>
+    </section>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite">
+    <svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg><span>命令已复制</span>
+  </div>
+
+  <script>
+    /**
+     * 页面数据：每个分类维护稳定的命令顺序；新增和排序只影响当前会话。
+     * 字段说明：icon 为页面内联图标名称，description 为分类用途，parameters 为结构化参数说明，outputExample 为必填的可信输出示例。
+     */
+    const categories = [
+      {
+        id: "linux", name: "Linux", icon: "terminal", description: "文件、进程与系统状态查看时常用的基础命令。",
+        commands: [
+          { id: "linux-1", title: "查看当前运行进程", code: "ps aux", note: "查看系统当前全部进程，并根据 PID、CPU、内存与 COMMAND 判断运行状态。", outputExample: "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot         1  0.0  0.2 168940 11732 ?        Ss   09:12   0:03 /sbin/init\nroot       418  0.0  0.1  15436  9088 ?        Ss   09:13   0:00 sshd: /usr/sbin/sshd -D\nredis      563  0.2  0.8  69548 34416 ?        Ssl  09:14   0:42 /usr/bin/redis-server 127.0.0.1:6379\nwww-data   731  0.1  0.4  56120 18124 ?        S    09:15   0:18 nginx: worker process\napp        842  2.4  8.7 1452380 352144 ?      Sl   10:03   3:41 node server.js\napp       1294  0.0  0.1  10244  5480 pts/0    Ss   11:02   0:00 -bash" },
+          { id: "linux-2", title: "查看端口占用", code: "sudo lsof -i :<port>", note: "将 <port> 替换为需要检查的端口号。", outputExample: "COMMAND PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    842  app   21u  IPv4  45128      0t0  TCP *:3000 (LISTEN)" },
+          { id: "linux-3", title: "按目录大小排序", code: "du -h --max-depth=1 | sort -h", note: "在当前目录统计一级子目录大小，并从小到大排列。", outputExample: "12K     ./scripts\n48M     ./logs\n1.2G    ./node_modules\n1.3G    ." }
+        ]
+      },
+      {
+        id: "docker", name: "Docker", icon: "box", description: "容器日常查看、排障和清理时最常用的一组命令。",
+        commands: [
+          { id: "docker-1", title: "查看运行中的容器", code: "docker ps", note: "仅显示当前处于运行状态的容器。", outputExample: "CONTAINER ID   IMAGE          COMMAND                  CREATED        STATUS        PORTS                    NAMES\n7f3c2a61d942   nginx:1.27     \"/docker-entrypoint…\"   2 hours ago    Up 2 hours    0.0.0.0:8080->80/tcp     web\na41e7be9c502   postgres:16    \"docker-entrypoint.s…\"   2 hours ago    Up 2 hours    0.0.0.0:5432->5432/tcp   db" },
+          { id: "docker-2", title: "查看最近 100 行日志并持续跟踪", code: "docker logs --tail 100 -f <container>", note: "将 <container> 替换为容器名称或 ID；按 Ctrl+C 停止跟踪。", outputExample: "2026-07-13T10:21:04.183Z INFO  server listening on 0.0.0.0:3000\n2026-07-13T10:21:09.742Z INFO  GET /health 200 3ms\n2026-07-13T10:21:12.016Z WARN  retrying database connection (1/3)" },
+          { id: "docker-3", title: "进入容器 Shell", code: "docker exec -it <container> /bin/sh", note: "适用于未安装 bash 的精简镜像；退出时输入 exit。", outputExample: "/app # pwd\n/app\n/app # ls\nDockerfile  node_modules  package.json  server.js\n/app #" },
+          { id: "docker-4", title: "查看容器资源占用", code: "docker stats --no-stream", note: "输出一次 CPU、内存和网络 I/O 快照后退出。", outputExample: "CONTAINER ID   NAME   CPU %   MEM USAGE / LIMIT     MEM %   NET I/O         BLOCK I/O\n7f3c2a61d942   web    0.02%   18.6MiB / 7.77GiB    0.23%   1.2MB / 840kB   0B / 0B\na41e7be9c502   db     0.31%   142.8MiB / 7.77GiB   1.80%   624kB / 1.1MB   8.2MB / 12MB" },
+          { id: "docker-5", title: "清理未使用镜像", code: "docker image prune -a", note: "会删除所有未被容器引用的镜像，执行前请确认不再需要。", outputExample: "WARNING! This will remove all images without at least one container associated to them.\nAre you sure you want to continue? [y/N] y\nDeleted Images:\nuntagged: demo-api:old\ndeleted: sha256:8a31f0d2c4e7…\n\nTotal reclaimed space: 486.3MB", risk: true }
+        ]
+      },
+      {
+        id: "git", name: "Git", icon: "git", description: "检查改动、整理提交与同步分支时常用的命令。",
+        commands: [
+          { id: "git-1", title: "查看工作区状态", code: "git status --short --branch", note: "紧凑显示当前分支、暂存区和工作区改动。", outputExample: "## feature/command-output...origin/feature/command-output\n M index.html\n?? notes/输出示例.md" },
+          { id: "git-2", title: "查看最近提交", code: "git log --oneline --decorate -10", note: "显示最近 10 条提交及其分支、标签引用。", outputExample: "c91a24f (HEAD -> main) 完善命令输出示例\n5b7e2d1 调整 Docker 命令顺序\n2fa308c 初始化命令看板" },
+          { id: "git-3", title: "暂存当前改动", code: "git stash push -u -m \"<message>\"", note: "同时暂存未跟踪文件，并为这次暂存添加说明。", outputExample: "Saved working directory and index state On main: 调整命令列表布局" }
+        ]
+      },
+      {
+        id: "ssh", name: "SSH", icon: "key", description: "连接远程主机与排查密钥认证问题时常用的命令。",
+        commands: [
+          { id: "ssh-1", title: "使用指定密钥连接", code: "ssh -i ~/.ssh/<key> <user>@<host>", note: "明确指定私钥文件、远程用户和主机地址。", outputExample: "Welcome to Ubuntu 24.04.2 LTS (GNU/Linux 6.8.0-62-generic x86_64)\nLast login: Sun Jul 13 09:42:18 2026 from 192.168.1.24\ndev@server:~$" },
+          { id: "ssh-2", title: "显示详细连接日志", code: "ssh -vvv <user>@<host>", note: "排查握手、密钥选择和认证失败时使用。", outputExample: "OpenSSH_9.6p1, OpenSSL 3.0.13\ndebug1: Connecting to server.example.com [203.0.113.10] port 22.\ndebug1: Connection established.\ndebug1: Offering public key: /home/dev/.ssh/id_ed25519 ED25519\ndebug1: Authentication succeeded (publickey)." }
+        ]
+      },
+      {
+        id: "network", name: "网络诊断", icon: "network", description: "快速确认 DNS、链路与 HTTP 服务可达性。",
+        commands: [
+          { id: "network-1", title: "查看 DNS 解析结果", code: "dig +short <domain>", note: "仅输出目标域名解析到的地址记录。", outputExample: "93.184.216.34" },
+          { id: "network-2", title: "检查 HTTP 响应头", code: "curl -I --connect-timeout 5 <url>", note: "只请求响应头，并将连接超时限制为 5 秒。", outputExample: "HTTP/2 200\ncontent-type: text/html; charset=UTF-8\ncontent-length: 1256\ncache-control: max-age=604800\ndate: Mon, 13 Jul 2026 02:24:16 GMT" }
+        ]
+      },
+      { id: "database", name: "数据库", icon: "database", description: "保存个人数据库维护命令；当前尚未添加内容。", commands: [] }
+    ];
+
+    /**
+     * 示例参数目录：与命令主体分离，便于保持原始示例数据紧凑，并确保每条命令展开后都有可信解释。
+     * 新增或编辑命令时会把参数写回命令对象，不依赖本目录。
+     */
+    const parameterCatalog = {
+      "linux-1": [
+        { name: "a", description: "显示终端上的所有进程" },
+        { name: "u", description: "以用户为中心的格式显示详细信息" },
+        { name: "x", description: "显示没有控制终端的进程" },
+        { name: "ps", description: "Process Status" }
+      ],
+      "linux-2": [
+        { name: "sudo", description: "以管理员权限执行端口检查" },
+        { name: "-i", description: "筛选网络连接和监听端口" },
+        { name: "<port>", description: "替换为需要检查的端口号" }
+      ],
+      "linux-3": [
+        { name: "-h", description: "使用便于阅读的容量单位" },
+        { name: "--max-depth=1", description: "只统计当前目录的一级子目录" },
+        { name: "sort -h", description: "按容量大小进行自然排序" }
+      ],
+      "docker-1": [{ name: "ps", description: "列出当前正在运行的容器" }],
+      "docker-2": [
+        { name: "--tail 100", description: "只显示最近 100 行日志" },
+        { name: "-f", description: "持续跟踪后续日志输出" },
+        { name: "<container>", description: "容器名称或 ID" }
+      ],
+      "docker-3": [
+        { name: "-it", description: "分配交互式终端" },
+        { name: "<container>", description: "需要进入的容器名称或 ID" },
+        { name: "/bin/sh", description: "启动精简镜像通常具备的 Shell" }
+      ],
+      "docker-4": [{ name: "--no-stream", description: "输出一次资源快照后退出" }],
+      "docker-5": [{ name: "-a", description: "删除所有未被容器引用的镜像" }],
+      "git-1": [
+        { name: "--short", description: "使用紧凑格式显示改动" },
+        { name: "--branch", description: "同时显示分支和上游状态" }
+      ],
+      "git-2": [
+        { name: "--oneline", description: "每条提交压缩为一行" },
+        { name: "--decorate", description: "显示分支和标签引用" },
+        { name: "-10", description: "只显示最近 10 条提交" }
+      ],
+      "git-3": [
+        { name: "-u", description: "同时暂存未跟踪文件" },
+        { name: "-m", description: "为暂存记录添加说明" }
+      ],
+      "ssh-1": [
+        { name: "-i", description: "指定用于认证的私钥文件" },
+        { name: "<user>@<host>", description: "远程用户名和主机地址" }
+      ],
+      "ssh-2": [{ name: "-vvv", description: "输出最高级别的连接调试日志" }],
+      "network-1": [
+        { name: "+short", description: "只输出简洁的解析结果" },
+        { name: "<domain>", description: "需要查询的域名" }
+      ],
+      "network-2": [
+        { name: "-I", description: "只请求并显示响应头" },
+        { name: "--connect-timeout 5", description: "连接超过 5 秒后停止等待" },
+        { name: "<url>", description: "需要检查的 HTTP 地址" }
+      ]
+    };
+
+    /* 启动时补齐示例参数；空数组表示命令没有额外参数，而不是数据缺失。 */
+    categories.forEach((category) => category.commands.forEach((command) => {
+      command.parameters = parameterCatalog[command.id] || [];
+    }));
+
+    /** 当前交互状态：默认进入 Linux，并仅展开首条 ps aux 的输出示例。 */
+    let activeCategoryId = "linux";
+    let editingCommandId = null;
+    let draggedCommandId = null;
+    let toastTimer = null;
+    const expandedCommandIds = new Set(["linux-1"]);
+
+    /**
+     * 同步状态只用于原型演示用户可见行为；正式桌面实现会由本地数据模块和 Git 适配器提供真实结果。
+     * repositoryPath 属于机器配置，hasLocalChanges 表示 commands.json 已修改但尚未推送。
+     */
+    const syncState = {
+      repositoryPath: "D:\\CommandShelf\\command-data",
+      hasLocalChanges: false,
+      operation: null,
+      error: null,
+      lastSyncedText: "刚刚"
+    };
+
+    /** DOM 引用集中声明，避免后续交互逻辑重复查询并保持职责清晰。 */
+    const categoryList = document.getElementById("category-list");
+    const commandList = document.getElementById("command-list");
+    const emptyState = document.getElementById("empty-state");
+    const categoryTitle = document.getElementById("category-title");
+    const categoryCount = document.getElementById("category-count");
+    const categoryDescription = document.getElementById("category-description");
+    const addCategoryButton = document.getElementById("add-category-button");
+    const addCommandButton = document.getElementById("add-command-button");
+    const drawerLayer = document.getElementById("drawer-layer");
+    const drawerTitle = document.getElementById("drawer-title");
+    const drawerContext = document.getElementById("drawer-context");
+    const commandForm = document.getElementById("command-form");
+    const titleInput = document.getElementById("command-title-input");
+    const codeInput = document.getElementById("command-code-input");
+    const noteInput = document.getElementById("command-note-input");
+    const parametersInput = document.getElementById("command-params-input");
+    const outputExampleInput = document.getElementById("command-output-input");
+    const riskInput = document.getElementById("command-risk-input");
+    const formError = document.getElementById("form-error");
+    const syncPanel = document.getElementById("sync-panel");
+    const repositoryButton = document.getElementById("repository-button");
+    const syncStatus = document.getElementById("sync-status");
+    const syncStatusLabel = document.getElementById("sync-status-label");
+    const syncMeta = document.getElementById("sync-meta");
+    const pullButton = document.getElementById("pull-button");
+    const pushButton = document.getElementById("push-button");
+    const repositoryDialogLayer = document.getElementById("repository-dialog-layer");
+    const repositoryForm = document.getElementById("repository-form");
+    const repositoryPathInput = document.getElementById("repository-path-input");
+    const repositoryError = document.getElementById("repository-error");
+    const toast = document.getElementById("toast");
+    const toastMessage = toast.querySelector("span");
+
+    /**
+     * 生成统一图标标记。
+     * @param {string} name sprite 图标名称。
+     * @returns {string} 可直接插入页面的无障碍隐藏 SVG 标记。
+     */
+    function icon(name) {
+      return `<svg class="icon" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
+    }
+
+    /**
+     * 对动态文本进行 HTML 转义，避免用户新增内容破坏页面结构。
+     * @param {unknown} value 需要显示的任意值。
+     * @returns {string} 可安全写入 innerHTML 的文本。
+     */
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>'"]/g, (character) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", "\"": "&quot;"
+      })[character]);
+    }
+
+    /**
+     * 把结构化参数转换为编辑抽屉使用的逐行文本，保证用户无需理解 JSON 数据结构。
+     * @param {Array<{name:string, description:string}>} parameters 参数列表。
+     * @returns {string} 使用“参数 = 说明”格式拼接的可编辑文本。
+     */
+    function formatParameters(parameters = []) {
+      return parameters.map((parameter) => `${parameter.name} = ${parameter.description}`).join("\n");
+    }
+
+    /**
+     * 解析参数输入；只接受同时包含名称和说明的行，忽略空行与不完整内容。
+     * @param {string} value 用户输入的逐行参数文本。
+     * @returns {Array<{name:string, description:string}>} 可直接保存和渲染的参数列表。
+     */
+    function parseParameters(value) {
+      return value.split(/\r?\n/).map((line) => {
+        const separatorIndex = line.indexOf("=");
+        if (separatorIndex < 0) return null;
+        const name = line.slice(0, separatorIndex).trim();
+        const description = line.slice(separatorIndex + 1).trim();
+        return name && description ? { name, description } : null;
+      }).filter(Boolean);
+    }
+
+    /**
+     * 从本地路径提取用于侧栏展示的仓库名称，完整路径仍保留在按钮提示中。
+     * @param {string} repositoryPath 本地 Git 仓库绝对路径。
+     * @returns {string} 路径最后一段；无路径时返回选择提示。
+     */
+    function getRepositoryName(repositoryPath) {
+      const normalized = repositoryPath.trim().replace(/[\\/]+$/, "");
+      return normalized ? normalized.split(/[\\/]/).pop() : "选择仓库";
+    }
+
+    /**
+     * 根据底层同步事实推导唯一的用户可见状态，优先级为未配置、同步中、失败、本地修改、已同步。
+     * @returns {{state:string, label:string, meta:string}} 当前同步状态的展示模型。
+     */
+    function getSyncView() {
+      if (!syncState.repositoryPath) {
+        return {
+          state: "unconfigured",
+          label: "未选择仓库",
+          meta: syncState.hasLocalChanges ? "修改已保存在本地，选择仓库后可同步。" : "选择已克隆的个人数据仓库。"
+        };
+      }
+      if (syncState.operation) {
+        const isPulling = syncState.operation === "pull";
+        return {
+          state: "syncing",
+          label: isPulling ? "正在拉取…" : "正在推送…",
+          meta: isPulling ? "正在检查远端 commands.json。" : "正在保存、提交并推送本地修改。"
+        };
+      }
+      if (syncState.error) {
+        return { state: "error", label: "同步失败", meta: syncState.error };
+      }
+      if (syncState.hasLocalChanges) {
+        return { state: "dirty", label: "本地有修改", meta: "修改已保存在本地，等待推送。" };
+      }
+      return { state: "synced", label: "已同步", meta: `上次同步：${syncState.lastSyncedText}` };
+    }
+
+    /** 渲染同步区域；按钮禁用规则同时防止重复操作和无意义推送。 */
+    function renderSync() {
+      const view = getSyncView();
+      const isBusy = Boolean(syncState.operation);
+      const hasRepository = Boolean(syncState.repositoryPath);
+      const canMutateData = hasRepository && !isBusy;
+      syncStatus.dataset.state = view.state;
+      syncStatusLabel.textContent = view.label;
+      syncMeta.textContent = view.meta;
+      syncPanel.setAttribute("aria-busy", String(isBusy));
+      repositoryButton.textContent = getRepositoryName(syncState.repositoryPath);
+      repositoryButton.title = hasRepository ? `${syncState.repositoryPath}；点击更换` : "选择本地数据仓库";
+      pullButton.textContent = syncState.operation === "pull" ? "拉取中…" : "拉取";
+      pushButton.textContent = syncState.operation === "push" ? "推送中…" : "推送";
+      pullButton.disabled = isBusy;
+      pushButton.disabled = isBusy || !hasRepository || !syncState.hasLocalChanges;
+      repositoryButton.disabled = isBusy;
+      addCategoryButton.disabled = !canMutateData;
+      addCommandButton.disabled = !canMutateData;
+      commandList.dataset.readonly = String(!canMutateData);
+      commandList.querySelectorAll("[data-edit-id]").forEach((button) => { button.disabled = !canMutateData; });
+      commandList.querySelectorAll("[data-command-id]").forEach((item) => { item.draggable = canMutateData; });
+    }
+
+    /**
+     * 展示全局反馈，错误状态会同步切换图标和颜色，但不会用提示条代替侧栏中的持久状态。
+     * @param {string} message 用户可理解的结果信息。
+     * @param {"success"|"error"} tone 反馈语气。
+     * @param {number} duration 展示时长，单位为毫秒。
+     */
+    function showToastFeedback(message, tone = "success", duration = 1800) {
+      const toastIcon = toast.querySelector("use");
+      toast.dataset.tone = tone;
+      toastMessage.textContent = message;
+      if (toastIcon) toastIcon.setAttribute("href", tone === "error" ? "#icon-x" : "#icon-check");
+      toast.classList.add("is-visible");
+      window.clearTimeout(toastTimer);
+      toastTimer = window.setTimeout(() => toast.classList.remove("is-visible"), duration);
+    }
+
+    /** 数据发生用户主动修改后立即标记为本地有修改，不影响本地浏览和编辑。 */
+    function markLocalChanges() {
+      syncState.hasLocalChanges = true;
+      syncState.error = null;
+      renderSync();
+    }
+
+    /** 打开仓库设置并回填当前路径；浏览器原型只验证设置流程，不访问真实文件系统。 */
+    function openRepositoryDialog() {
+      repositoryPathInput.value = syncState.repositoryPath;
+      repositoryError.textContent = "";
+      repositoryDialogLayer.classList.add("is-open");
+      repositoryDialogLayer.setAttribute("aria-hidden", "false");
+      window.setTimeout(() => repositoryPathInput.focus(), 80);
+    }
+
+    /** 关闭仓库设置并把焦点归还同步入口。 */
+    function closeRepositoryDialog() {
+      repositoryDialogLayer.classList.remove("is-open");
+      repositoryDialogLayer.setAttribute("aria-hidden", "true");
+      repositoryError.textContent = "";
+      repositoryButton.focus();
+    }
+
+    /**
+     * 模拟拉取或推送的用户流程；真实 Git 调用留到桌面技术设计和实现阶段。
+     * @param {"pull"|"push"} operation 用户主动选择的同步操作。
+     */
+    function runSyncOperation(operation) {
+      if (!syncState.repositoryPath) {
+        openRepositoryDialog();
+        return;
+      }
+      if (syncState.operation) return;
+      if (operation === "pull" && syncState.hasLocalChanges) {
+        syncState.error = "请先推送本地修改，再拉取远端更新。";
+        renderSync();
+        showToastFeedback("拉取已停止，本地修改未受影响", "error", 2400);
+        return;
+      }
+      if (operation === "push" && !syncState.hasLocalChanges) return;
+
+      syncState.operation = operation;
+      syncState.error = null;
+      renderSync();
+      window.setTimeout(() => {
+        syncState.operation = null;
+        syncState.error = null;
+        syncState.lastSyncedText = "刚刚";
+        if (operation === "push") syncState.hasLocalChanges = false;
+        renderSync();
+        showToastFeedback(operation === "pull" ? "已拉取最新命令" : "本地修改已推送");
+      }, 900);
+    }
+
+    /** 返回当前选中的分类对象；固定分类始终保证能找到回退项。 */
+    function getActiveCategory() {
+      return categories.find((category) => category.id === activeCategoryId) || categories[0];
+    }
+
+    /** 渲染左侧分类，数量与命令数据实时同步。 */
+    function renderCategories() {
+      categoryList.innerHTML = categories.map((category) => `
+        <li data-od-id="category-item-${category.id}">
+          <button class="category-button" type="button" data-category-id="${category.id}" ${category.id === activeCategoryId ? 'aria-current="page"' : ""}>
+            ${icon(category.icon)}
+            <span class="category-name">${escapeHtml(category.name)}</span>
+            <span class="category-count">${category.commands.length}</span>
+          </button>
+        </li>
+      `).join("");
+    }
+
+    /** 渲染当前分类的连续命令清单，并把展开条目组织为说明与输出双栏。 */
+    function renderWorkspace() {
+      const category = getActiveCategory();
+      categoryTitle.textContent = category.name;
+      categoryCount.textContent = `${category.commands.length} 条命令`;
+      categoryDescription.textContent = category.description;
+      commandList.hidden = category.commands.length === 0;
+      emptyState.hidden = category.commands.length !== 0;
+
+      commandList.innerHTML = category.commands.map((command, index) => {
+        const isOutputExpanded = expandedCommandIds.has(command.id);
+        const parameters = Array.isArray(command.parameters) ? command.parameters : [];
+        const parameterMarkup = parameters.length > 0
+          ? `<ul class="parameter-list">${parameters.map((parameter) => `
+              <li class="parameter-item">
+                <code class="parameter-name">${escapeHtml(parameter.name)}</code>
+                <span>${escapeHtml(parameter.description)}</span>
+              </li>
+            `).join("")}</ul>`
+          : '<p class="parameter-empty">这条命令没有需要额外说明的参数。</p>';
+        const commandNumber = String(index + 1).padStart(2, "0");
+        return `
+        <li class="command-item" draggable="true" data-command-id="${command.id}" data-od-id="command-item-${command.id}">
+          <div class="command-header">
+            <button class="command-toggle" type="button" data-output-id="${command.id}" aria-expanded="${isOutputExpanded}" aria-controls="output-panel-${command.id}" aria-label="${isOutputExpanded ? "收起" : "展开"}${escapeHtml(command.title)}详情" data-od-id="output-toggle-${command.id}">
+              ${icon("chevron")}
+            </button>
+            <button class="drag-handle" type="button" title="拖动调整顺序" aria-label="${commandNumber}，拖动“${escapeHtml(command.title)}”调整顺序">${commandNumber}</button>
+            <div class="command-heading">
+              <h2 class="command-title" data-od-id="command-title-${command.id}">${escapeHtml(command.title)}</h2>
+              ${command.risk ? '<span class="risk-badge">谨慎执行</span>' : ""}
+            </div>
+            <code class="code-box" data-od-id="command-code-${command.id}">${escapeHtml(command.code)}</code>
+            <div class="command-actions">
+              <button class="action-button copy-button" type="button" data-copy-id="${command.id}" aria-label="复制${escapeHtml(command.title)}" title="复制" data-od-id="copy-button-${command.id}">
+                ${icon("copy")}<span class="visually-hidden">复制</span>
+              </button>
+              <button class="action-button icon-only edit-button" type="button" data-edit-id="${command.id}" aria-label="编辑${escapeHtml(command.title)}" title="编辑" data-od-id="edit-button-${command.id}">
+                ${icon("edit")}
+              </button>
+            </div>
+          </div>
+          <div class="command-detail" id="output-panel-${command.id}" ${isOutputExpanded ? "" : "hidden"} data-od-id="output-panel-${command.id}">
+            <div class="detail-column">
+              <section class="detail-section">
+                <h3 class="detail-label">命令说明</h3>
+                <p class="detail-description">${escapeHtml(command.note || "暂未补充命令说明。")}</p>
+              </section>
+              <section class="detail-section">
+                <h3 class="detail-label">用法</h3>
+                <code class="usage-box">${escapeHtml(command.code)}</code>
+              </section>
+              <section class="detail-section">
+                <h3 class="detail-label">参数说明</h3>
+                ${parameterMarkup}
+              </section>
+            </div>
+            <div class="detail-column output-column">
+              <h3 class="detail-label">参考输出</h3>
+              <pre class="output-example" data-od-id="output-example-${command.id}">${escapeHtml(command.outputExample)}</pre>
+              <div class="output-footer">
+                <span>实际内容因环境不同而变化</span>
+                <button class="action-button copy-output-button" type="button" data-copy-output-id="${command.id}">
+                  ${icon("copy")}<span>复制输出</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </li>
+      `;
+      }).join("");
+    }
+
+    /** 同步全部可见区域；数据修改后统一调用以避免计数与内容不同步。 */
+    function render() {
+      renderCategories();
+      renderWorkspace();
+      renderSync();
+    }
+
+    /**
+     * 打开新增或编辑抽屉，并将焦点移动到首个字段。
+     * @param {string|null} commandId 编辑时传入命令 ID；新增时保持为空。
+     */
+    function openDrawer(commandId = null) {
+      const category = getActiveCategory();
+      const command = commandId ? category.commands.find((item) => item.id === commandId) : null;
+      editingCommandId = command?.id || null;
+      commandForm.reset();
+      formError.textContent = "";
+      drawerTitle.textContent = command ? "编辑命令" : "添加命令";
+      drawerContext.textContent = `保存到 ${category.name} 分类`;
+      document.getElementById("drawer-save").textContent = command ? "保存修改" : "保存命令";
+
+      if (command) {
+        titleInput.value = command.title;
+        codeInput.value = command.code;
+        noteInput.value = command.note || "";
+        parametersInput.value = formatParameters(command.parameters);
+        outputExampleInput.value = command.outputExample;
+        riskInput.checked = Boolean(command.risk);
+      }
+
+      drawerLayer.classList.add("is-open");
+      drawerLayer.setAttribute("aria-hidden", "false");
+      window.setTimeout(() => titleInput.focus(), 180);
+    }
+
+    /** 关闭抽屉并清除编辑上下文，取消操作不会修改数据。 */
+    function closeDrawer() {
+      drawerLayer.classList.remove("is-open");
+      drawerLayer.setAttribute("aria-hidden", "true");
+      editingCommandId = null;
+      formError.textContent = "";
+      document.getElementById("add-command-button").focus();
+    }
+
+    /**
+     * 展示短暂成功反馈；多次复制时重置计时，避免提示闪烁。
+     * @param {HTMLElement} button 触发复制的按钮。
+     * @param {string} toastText 反馈条中展示的成功消息。
+     */
+    function showCopiedFeedback(button, toastText = "命令已复制") {
+      const label = button.querySelector("span");
+      const previousIcon = button.querySelector("use");
+      const originalLabel = label?.textContent || "复制";
+      button.classList.add("is-copied");
+      if (label) label.textContent = "已复制";
+      if (previousIcon) previousIcon.setAttribute("href", "#icon-check");
+      showToastFeedback(toastText);
+      window.setTimeout(() => {
+        button.classList.remove("is-copied");
+        if (label) label.textContent = originalLabel;
+        if (previousIcon) previousIcon.setAttribute("href", "#icon-copy");
+      }, 1400);
+    }
+
+    /**
+     * 复制命令文本；受限环境中使用隐藏 textarea 作为兼容回退。
+     * @param {string} text 需要复制的命令。
+     * @returns {Promise<void>} 复制流程完成后结束。
+     */
+    async function copyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+      const temporary = document.createElement("textarea");
+      temporary.value = text;
+      temporary.setAttribute("readonly", "");
+      temporary.style.position = "fixed";
+      temporary.style.opacity = "0";
+      document.body.appendChild(temporary);
+      temporary.select();
+      document.execCommand("copy");
+      temporary.remove();
+    }
+
+    /** 分类点击委托：切换后保持分类顺序稳定并立即刷新内容。 */
+    categoryList.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-category-id]");
+      if (!button || button.dataset.categoryId === activeCategoryId) return;
+      activeCategoryId = button.dataset.categoryId;
+      render();
+    });
+
+    /** 命令区点击委托：统一处理详情展开、命令与输出复制以及条目编辑。 */
+    commandList.addEventListener("click", async (event) => {
+      const outputButton = event.target.closest("[data-output-id]");
+      const copyButton = event.target.closest("[data-copy-id]");
+      const copyOutputButton = event.target.closest("[data-copy-output-id]");
+      const editButton = event.target.closest("[data-edit-id]");
+      const category = getActiveCategory();
+
+      if (outputButton) {
+        const commandId = outputButton.dataset.outputId;
+        /* 直接读取 aria-controls，确保无障碍关联与实际切换目标始终指向同一容器。 */
+        const output = document.getElementById(outputButton.getAttribute("aria-controls"));
+        if (!output) return;
+        const willExpand = outputButton.getAttribute("aria-expanded") !== "true";
+        outputButton.setAttribute("aria-expanded", String(willExpand));
+        outputButton.setAttribute("aria-label", `${willExpand ? "收起" : "展开"}${outputButton.closest(".command-item").querySelector(".command-title").textContent}详情`);
+        output.hidden = !willExpand;
+        if (willExpand) expandedCommandIds.add(commandId);
+        else expandedCommandIds.delete(commandId);
+      }
+
+      if (copyButton) {
+        const command = category.commands.find((item) => item.id === copyButton.dataset.copyId);
+        if (!command) return;
+        try {
+          await copyText(command.code);
+          showCopiedFeedback(copyButton);
+        } catch (error) {
+          showToastFeedback("复制失败，请手动选择命令", "error");
+        }
+      }
+
+      if (copyOutputButton) {
+        const command = category.commands.find((item) => item.id === copyOutputButton.dataset.copyOutputId);
+        if (!command) return;
+        try {
+          await copyText(command.outputExample);
+          showCopiedFeedback(copyOutputButton, "参考输出已复制");
+        } catch (error) {
+          showToastFeedback("复制失败，请手动选择参考输出", "error");
+        }
+      }
+
+      if (editButton) openDrawer(editButton.dataset.editId);
+    });
+
+    /** 拖拽排序：仅响应用户显式拖动，不根据使用频率自动重排。 */
+    commandList.addEventListener("dragstart", (event) => {
+      if (!syncState.repositoryPath || syncState.operation) {
+        event.preventDefault();
+        return;
+      }
+      const item = event.target.closest("[data-command-id]");
+      if (!item) return;
+      draggedCommandId = item.dataset.commandId;
+      item.classList.add("is-dragging");
+      event.dataTransfer.effectAllowed = "move";
+    });
+
+    commandList.addEventListener("dragover", (event) => {
+      const item = event.target.closest("[data-command-id]");
+      if (!item || item.dataset.commandId === draggedCommandId) return;
+      event.preventDefault();
+      commandList.querySelectorAll(".is-drag-over").forEach((node) => node.classList.remove("is-drag-over"));
+      item.classList.add("is-drag-over");
+    });
+
+    commandList.addEventListener("drop", (event) => {
+      const target = event.target.closest("[data-command-id]");
+      const category = getActiveCategory();
+      if (!target || !draggedCommandId || target.dataset.commandId === draggedCommandId) return;
+      event.preventDefault();
+      const fromIndex = category.commands.findIndex((item) => item.id === draggedCommandId);
+      const toIndex = category.commands.findIndex((item) => item.id === target.dataset.commandId);
+      const [moved] = category.commands.splice(fromIndex, 1);
+      category.commands.splice(toIndex, 0, moved);
+      renderWorkspace();
+      markLocalChanges();
+    });
+
+    commandList.addEventListener("dragend", () => {
+      draggedCommandId = null;
+      commandList.querySelectorAll(".is-dragging, .is-drag-over").forEach((node) => node.classList.remove("is-dragging", "is-drag-over"));
+    });
+
+    /** 新增命令入口始终作用于当前分类。 */
+    document.getElementById("add-command-button").addEventListener("click", () => openDrawer());
+    document.getElementById("drawer-close").addEventListener("click", closeDrawer);
+    document.getElementById("drawer-cancel").addEventListener("click", closeDrawer);
+    document.getElementById("drawer-dismiss").addEventListener("click", closeDrawer);
+
+    /**
+     * 添加分类使用原生轻量输入，避免引入不必要的二级管理界面。
+     * 空名称或重复名称不会创建分类。
+     */
+    document.getElementById("add-category-button").addEventListener("click", () => {
+      const name = window.prompt("请输入分类名称");
+      const normalized = name?.trim();
+      if (!normalized || categories.some((category) => category.name === normalized)) return;
+      const id = `custom-${Date.now()}`;
+      categories.push({ id, name: normalized, icon: "terminal", description: `保存与“${normalized}”相关的个人常用命令。`, commands: [] });
+      activeCategoryId = id;
+      render();
+      markLocalChanges();
+    });
+
+    /** 表单提交：校验关键字段后新增或原位更新命令，保持列表顺序不变。 */
+    commandForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const title = titleInput.value.trim();
+      const code = codeInput.value.trim();
+      const note = noteInput.value.trim();
+      const parameters = parseParameters(parametersInput.value);
+      const outputExample = outputExampleInput.value.trim();
+      const category = getActiveCategory();
+
+      if (!title || !code || !outputExample) {
+        formError.textContent = "请填写任务标题、命令正文和输出示例。";
+        (!title ? titleInput : !code ? codeInput : outputExampleInput).focus();
+        return;
+      }
+
+      if (editingCommandId) {
+        const command = category.commands.find((item) => item.id === editingCommandId);
+        if (command) Object.assign(command, { title, code, note, parameters, outputExample, risk: riskInput.checked });
+      } else {
+        category.commands.push({ id: `${category.id}-${Date.now()}`, title, code, note, parameters, outputExample, risk: riskInput.checked });
+      }
+
+      render();
+      markLocalChanges();
+      closeDrawer();
+    });
+
+    /** 同步入口只触发显式操作，不在后台或页面加载时自动访问网络。 */
+    repositoryButton.addEventListener("click", openRepositoryDialog);
+    pullButton.addEventListener("click", () => runSyncOperation("pull"));
+    pushButton.addEventListener("click", () => runSyncOperation("push"));
+    document.getElementById("repository-cancel").addEventListener("click", closeRepositoryDialog);
+    document.getElementById("repository-dialog-dismiss").addEventListener("click", closeRepositoryDialog);
+
+    /** 仓库路径提交只更新当前电脑的设置视图，不把路径写入命令数据。 */
+    repositoryForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const repositoryPath = repositoryPathInput.value.trim();
+      if (!repositoryPath) {
+        repositoryError.textContent = "请选择或填写本地 Git 仓库路径。";
+        repositoryPathInput.focus();
+        return;
+      }
+      if (syncState.repositoryPath && syncState.hasLocalChanges && repositoryPath !== syncState.repositoryPath) {
+        repositoryError.textContent = "当前仓库还有本地修改，请先推送后再更换仓库。";
+        repositoryPathInput.focus();
+        return;
+      }
+      syncState.repositoryPath = repositoryPath;
+      syncState.error = null;
+      syncState.operation = null;
+      syncState.lastSyncedText = "刚刚";
+      renderSync();
+      closeRepositoryDialog();
+      showToastFeedback("数据仓库已连接");
+    });
+
+    /** Escape 优先关闭最上层对话框，避免按键继续影响底层页面。 */
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      if (repositoryDialogLayer.classList.contains("is-open")) {
+        event.preventDefault();
+        closeRepositoryDialog();
+        return;
+      }
+      if (!drawerLayer.classList.contains("is-open")) return;
+      event.preventDefault();
+      closeDrawer();
+    });
+
+    /**
+     * 仅向浏览器验收脚本暴露同步场景切换，不属于正式桌面应用公共 API。
+     * @param {"unconfigured"|"synced"|"dirty"|"error"|"pulling"|"pushing"} scenario 需要检查的状态。
+     */
+    window.CommandShelfPrototype = Object.freeze({
+      setSyncScenario(scenario) {
+        const knownScenarios = new Set(["unconfigured", "synced", "dirty", "error", "pulling", "pushing"]);
+        if (!knownScenarios.has(scenario)) throw new Error("未知的同步验收场景");
+        syncState.repositoryPath = scenario === "unconfigured" ? "" : "D:\\CommandShelf\\command-data";
+        syncState.hasLocalChanges = scenario === "dirty" || scenario === "error" || scenario === "pushing";
+        syncState.operation = scenario === "pulling" ? "pull" : scenario === "pushing" ? "push" : null;
+        syncState.error = scenario === "error" ? "网络连接失败，本地数据未发生变化。" : null;
+        renderSync();
+      }
+    });
+
+    /* 首次渲染默认进入 Linux，并展开首条进程命令的可信输出。 */
+    render();
+  </script>
+</body>
+</html>

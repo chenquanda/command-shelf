@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"仅允许主窗口使用 Tauri 核心窗口能力；文件与 Git 只能通过应用自定义命令访问。","local":true,"windows":["main"],"permissions":["core:default"]}}

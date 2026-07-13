@@ -1,0 +1,13 @@
+# Rust 与 Tauri 本地构建缓存不进入源码仓库。
+/src-tauri/target/
+
+# Node 临时依赖与通用日志仅属于开发机。
+/node_modules/
+/.lighthouse-sync*/
+*.log
+
+# 编辑器与操作系统生成文件不属于产品源码。
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
