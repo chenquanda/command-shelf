@@ -1,7 +1,7 @@
 <!--
   文件职责：提供 CommandShelf 正式 Tauri 桌面前端，并保留浏览器独立预览能力。
-  主要内容：展示真实命令文档、连接本地数据仓库，并复用已确认的分类、详情和同步视觉系统。
-  重要约束：桌面模式只能通过显式 Tauri 命令访问文件；S1 暂不开放数据修改和真实拉取/推送。
+  主要内容：展示与维护真实命令文档、连接本地数据仓库，并呈现安全拉取、推送和失败恢复状态。
+  重要约束：桌面模式只能通过显式 Tauri 命令访问文件；同步期间禁止修改，但浏览、展开和复制保持可用。
 -->
 <!doctype html>
 <html lang="zh-CN">
@@ -1924,7 +1924,7 @@
           </label>
           <label class="field">
             <span class="field-label">用途说明</span>
-            <textarea class="text-area" id="command-note-input" name="note" maxlength="120" placeholder="说明参数含义、适用场景或使用前提。" data-od-id="command-note-input"></textarea>
+            <textarea class="text-area" id="command-note-input" name="note" maxlength="4000" placeholder="说明参数含义、适用场景或使用前提。" data-od-id="command-note-input"></textarea>
           </label>
           <label class="field">
             <span class="field-label">参数说明</span>
@@ -2108,11 +2108,13 @@
     const expandedCommandIds = new Set(["linux-1"]);
 
     /**
-     * 同步状态只用于原型演示用户可见行为；正式桌面实现会由本地数据模块和 Git 适配器提供真实结果。
-     * repositoryPath 属于机器配置，hasLocalChanges 表示 commands.json 已修改但尚未推送。
+     * 页面侧同步状态由桌面后端快照更新；浏览器预览使用同一模型演示用户可见行为。
+     * repositoryPath 属于机器配置，repositoryAvailable 区分“记住旧路径”和“当前可安全读写”。
+     * hasLocalChanges 表示 commands.json 已修改但尚未推送。
      */
     const syncState = {
       repositoryPath: isDesktopRuntime ? "" : "D:\\CommandShelf\\command-data",
+      repositoryAvailable: !isDesktopRuntime,
       hasLocalChanges: false,
       operation: isDesktopRuntime ? "load" : null,
       error: null,
@@ -2142,6 +2144,7 @@
     const parametersInput = document.getElementById("command-params-input");
     const outputExampleInput = document.getElementById("command-output-input");
     const riskInput = document.getElementById("command-risk-input");
+    const drawerSaveButton = document.getElementById("drawer-save");
     const formError = document.getElementById("form-error");
     const syncPanel = document.getElementById("sync-panel");
     const repositoryButton = document.getElementById("repository-button");
@@ -2202,6 +2205,24 @@
     }
 
     /**
+     * 合并编辑抽屉未直接暴露的兼容字段，编辑用途说明时仍保留独立 `notes`、自定义用法和风险说明。
+     * @param {object} command 编辑前的完整界面命令模型。
+     * @param {string} code 本次表单中的命令正文。
+     * @param {string} note 本次表单中的合并说明文本。
+     * @param {boolean} risky 本次是否保留风险标记。
+     * @returns {{description:string, notes:string, usage:string, riskNote:string}} 应写回稳定文档的兼容字段。
+     */
+    function resolveEditedMetadata(command, code, note, risky) {
+      const codeChanged = code !== command.code;
+      return {
+        description: note,
+        notes: command.notes || "",
+        usage: codeChanged ? code : (command.usage || code),
+        riskNote: risky ? command.riskNote || "执行前请确认影响范围。" : ""
+      };
+    }
+
+    /**
      * 从本地路径提取用于侧栏展示的仓库名称，完整路径仍保留在按钮提示中。
      * @param {string} repositoryPath 本地 Git 仓库绝对路径。
      * @returns {string} 路径最后一段；无路径时返回选择提示。
@@ -2212,7 +2233,7 @@
     }
 
     /**
-     * 根据底层同步事实推导唯一的用户可见状态，优先级为未配置、同步中、失败、本地修改、已同步。
+     * 根据底层同步事实推导唯一的用户可见状态，优先级为同步中、失败、未配置、本地修改、已同步。
      * @returns {{state:string, label:string, meta:string}} 当前同步状态的展示模型。
      */
     function getSyncView() {
@@ -2223,13 +2244,6 @@
           state: "syncing",
           label: isLoading ? "正在加载…" : isSaving ? "正在保存…" : "正在连接…",
           meta: syncState.statusMessage || (isSaving ? "正在安全写入 commands.json。" : "正在校验本地数据仓库。")
-        };
-      }
-      if (!syncState.repositoryPath) {
-        return {
-          state: "unconfigured",
-          label: "未选择仓库",
-          meta: syncState.hasLocalChanges ? "修改已保存在本地，选择仓库后可同步。" : "选择已克隆的个人数据仓库。"
         };
       }
       if (syncState.operation) {
@@ -2243,6 +2257,13 @@
       if (syncState.error) {
         return { state: "error", label: "同步失败", meta: syncState.error };
       }
+      if (!syncState.repositoryPath) {
+        return {
+          state: "unconfigured",
+          label: "未选择仓库",
+          meta: syncState.hasLocalChanges ? "修改已保存在本地，选择仓库后可同步。" : "选择已克隆的个人数据仓库。"
+        };
+      }
       if (syncState.hasLocalChanges) {
         return { state: "dirty", label: "本地有修改", meta: syncState.statusMessage || "修改已保存在本地，等待推送。" };
       }
@@ -2254,7 +2275,8 @@
       const view = getSyncView();
       const isBusy = Boolean(syncState.operation);
       const hasRepository = Boolean(syncState.repositoryPath);
-      const canMutateData = hasRepository && !isBusy;
+      const hasUsableRepository = hasRepository && syncState.repositoryAvailable;
+      const canMutateData = hasUsableRepository && !isBusy;
       syncStatus.dataset.state = view.state;
       syncStatusLabel.textContent = view.label;
       syncMeta.textContent = view.meta;
@@ -2263,11 +2285,13 @@
       repositoryButton.title = hasRepository ? `${syncState.repositoryPath}；点击更换` : "选择本地数据仓库";
       pullButton.textContent = syncState.operation === "pull" ? "拉取中…" : "拉取";
       pushButton.textContent = syncState.operation === "push" ? "推送中…" : "推送";
-      pullButton.disabled = isBusy;
-      pushButton.disabled = isBusy || !hasRepository || !syncState.hasLocalChanges;
+      pullButton.disabled = isBusy || !hasUsableRepository;
+      pushButton.disabled = isBusy || !hasUsableRepository || !syncState.hasLocalChanges;
       repositoryButton.disabled = isBusy;
       addCategoryButton.disabled = !canMutateData;
       addCommandButton.disabled = !canMutateData || categories.length === 0;
+      [titleInput, codeInput, noteInput, parametersInput, outputExampleInput, riskInput, drawerSaveButton]
+        .forEach((control) => { control.disabled = !canMutateData; });
       commandList.dataset.readonly = String(!canMutateData);
       commandList.querySelectorAll("[data-edit-id]").forEach((button) => { button.disabled = !canMutateData; });
       commandList.querySelectorAll("[data-command-id]").forEach((item) => { item.draggable = canMutateData; });
@@ -2319,7 +2343,7 @@
      * @returns {Promise<void>} 操作结束或安全停止后完成。
      */
     async function runSyncOperation(operation) {
-      if (!syncState.repositoryPath) {
+      if (!syncState.repositoryPath || !syncState.repositoryAvailable) {
         openRepositoryDialog();
         return;
       }
@@ -2393,18 +2417,20 @@
     function renderWorkspace() {
       const category = getActiveCategory();
       if (!category) {
-        categoryTitle.textContent = syncState.repositoryPath ? "还没有分类" : "连接你的命令仓库";
+        categoryTitle.textContent = syncState.repositoryAvailable ? "还没有分类" : "连接你的命令仓库";
         categoryCount.textContent = "0 条命令";
-        categoryDescription.textContent = syncState.repositoryPath
+        categoryDescription.textContent = syncState.repositoryAvailable
           ? "数据仓库已经连接；从第一个分类开始建立你的个人命令架。"
           : "先在左侧选择已经克隆到本机的个人 Git 数据仓库。";
         commandList.innerHTML = "";
         commandList.hidden = true;
         emptyState.hidden = false;
-        emptyState.querySelector("h2").textContent = syncState.repositoryPath ? "命令架还是空的" : "尚未选择数据仓库";
-        emptyState.querySelector("p").textContent = syncState.repositoryPath
+        emptyState.querySelector("h2").textContent = syncState.repositoryAvailable ? "命令架还是空的" : "数据仓库当前不可用";
+        emptyState.querySelector("p").textContent = syncState.repositoryAvailable
           ? "点击左侧“添加分类”，正式数据不会自动混入原型示例。"
-          : "点击左侧“选择仓库”，连接后即可加载你的 commands.json。";
+          : syncState.repositoryPath
+            ? "点击左侧仓库名称，重新选择可用目录后即可恢复 commands.json。"
+            : "点击左侧“选择仓库”，连接后即可加载你的 commands.json。";
         return;
       }
       categoryTitle.textContent = category.name;
@@ -2489,6 +2515,7 @@
      * @param {string|null} commandId 编辑时传入命令 ID；新增时保持为空。
      */
     function openDrawer(commandId = null) {
+      if (!syncState.repositoryAvailable || syncState.operation) return;
       const category = getActiveCategory();
       if (!category) return;
       const command = commandId ? category.commands.find((item) => item.id === commandId) : null;
@@ -2502,7 +2529,7 @@
       if (command) {
         titleInput.value = command.title;
         codeInput.value = command.code;
-        noteInput.value = command.note || "";
+        noteInput.value = command.description ?? command.note ?? "";
         parametersInput.value = formatParameters(command.parameters);
         outputExampleInput.value = command.outputExample;
         riskInput.checked = Boolean(command.risk);
@@ -2619,7 +2646,7 @@
 
     /** 拖拽排序：仅响应用户显式拖动，不根据使用频率自动重排。 */
     commandList.addEventListener("dragstart", (event) => {
-      if (!syncState.repositoryPath || syncState.operation) {
+      if (!syncState.repositoryAvailable || syncState.operation) {
         event.preventDefault();
         return;
       }
@@ -2669,6 +2696,7 @@
      * 空名称或重复名称不会创建分类。
      */
     document.getElementById("add-category-button").addEventListener("click", async () => {
+      if (!syncState.repositoryAvailable || syncState.operation) return;
       const name = window.prompt("请输入分类名称");
       const normalized = name?.trim();
       if (!normalized || categories.some((category) => category.name === normalized)) return;
@@ -2684,6 +2712,14 @@
     /** 表单提交：校验关键字段后新增或原位更新命令，保持列表顺序不变。 */
     commandForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (!syncState.repositoryAvailable) {
+        formError.textContent = "数据仓库当前不可用，请重新选择仓库后再修改。";
+        return;
+      }
+      if (syncState.operation) {
+        formError.textContent = "当前正在保存或同步，请等待操作结束后再修改。";
+        return;
+      }
       const title = titleInput.value.trim();
       const code = codeInput.value.trim();
       const note = noteInput.value.trim();
@@ -2703,18 +2739,21 @@
 
       if (editingCommandId) {
         const command = category.commands.find((item) => item.id === editingCommandId);
-        if (command) Object.assign(command, {
-          title,
-          code,
-          note,
-          description: note,
-          notes: "",
-          usage: code,
-          parameters,
-          outputExample,
-          risk: riskInput.checked,
-          riskNote: riskInput.checked ? "执行前请确认影响范围。" : ""
-        });
+        if (command) {
+          const metadata = resolveEditedMetadata(command, code, note, riskInput.checked);
+          Object.assign(command, {
+            title,
+            code,
+            note: [note, metadata.notes].filter(Boolean).join("\n"),
+            description: metadata.description,
+            notes: metadata.notes,
+            usage: metadata.usage,
+            parameters,
+            outputExample,
+            risk: riskInput.checked,
+            riskNote: metadata.riskNote
+          });
+        }
       } else {
         const id = isDesktopRuntime ? `command-${crypto.randomUUID()}` : `${category.id}-${Date.now()}`;
         category.commands.push({
@@ -2819,6 +2858,7 @@
         expandedCommandIds.add(categories[0].commands[0].id);
       }
       syncState.repositoryPath = snapshot.repositoryPath || "";
+      syncState.repositoryAvailable = Boolean(snapshot.repositoryPath) && snapshot.syncState !== "error";
       syncState.hasLocalChanges = snapshot.syncState === "dirty";
       syncState.operation = null;
       syncState.error = snapshot.error
@@ -2886,6 +2926,7 @@
         applyDesktopSnapshot(snapshot);
       } catch (error) {
         syncState.operation = null;
+        syncState.repositoryAvailable = false;
         syncState.error = error?.message || "桌面后端暂时不可用。";
         syncState.statusMessage = "重新启动应用后重试。";
         render();
@@ -2932,6 +2973,7 @@
       }
 
       syncState.repositoryPath = repositoryPath;
+      syncState.repositoryAvailable = true;
       syncState.error = null;
       syncState.operation = null;
       syncState.statusMessage = "";
@@ -2964,6 +3006,7 @@
           const knownScenarios = new Set(["unconfigured", "synced", "dirty", "error", "pulling", "pushing"]);
           if (!knownScenarios.has(scenario)) throw new Error("未知的同步验收场景");
           syncState.repositoryPath = scenario === "unconfigured" ? "" : "D:\\CommandShelf\\command-data";
+          syncState.repositoryAvailable = scenario !== "unconfigured";
           syncState.hasLocalChanges = scenario === "dirty" || scenario === "error" || scenario === "pushing";
           syncState.operation = scenario === "pulling" ? "pull" : scenario === "pushing" ? "push" : null;
           syncState.error = scenario === "error" ? "网络连接失败，本地数据未发生变化。" : null;

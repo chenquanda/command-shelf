@@ -48,7 +48,7 @@ pub fn load_config(directory: &Path) -> Result<Option<AppConfig>, AppError> {
         AppError::new(
             "CONFIG_INVALID",
             format!("当前电脑配置格式无效：{error}"),
-            "移走 config.json 后重新选择数据仓库。",
+            "在应用中重新选择数据仓库以覆盖配置；如仍失败，移走 config.json 后重试。",
             false,
         )
     })?;
@@ -56,7 +56,7 @@ pub fn load_config(directory: &Path) -> Result<Option<AppConfig>, AppError> {
         return Err(AppError::new(
             "CONFIG_INVALID",
             "当前电脑配置版本或仓库路径无效。",
-            "移走 config.json 后重新选择数据仓库。",
+            "在应用中重新选择数据仓库以覆盖配置；如仍失败，移走 config.json 后重试。",
             false,
         ));
     }
@@ -86,9 +86,10 @@ pub fn save_config(directory: &Path, config: &AppConfig) -> Result<(), AppError>
 
 #[cfg(test)]
 mod tests {
-    //! 测试职责：验证机器配置首次缺失、保存和重启读取行为。
+    //! 测试职责：验证机器配置首次缺失、保存、重启读取和损坏恢复提示。
 
     use super::{load_config, save_config, AppConfig};
+    use std::fs;
 
     /// 验证配置在新的服务实例中仍能完整恢复。
     #[test]
@@ -105,6 +106,46 @@ mod tests {
         assert_eq!(
             load_config(directory.path()).expect("配置读取应成功"),
             Some(expected)
+        );
+    }
+
+    /// 验证损坏 JSON 不会被当成首次运行，避免掩盖真实配置故障。
+    #[test]
+    fn rejects_malformed_machine_config() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        fs::write(directory.path().join("config.json"), b"{not-json").expect("应能写入损坏配置");
+
+        let error = load_config(directory.path()).expect_err("损坏配置应返回错误");
+        assert_eq!(error.code, "CONFIG_INVALID");
+        assert!(!error.retryable);
+    }
+
+    /// 验证不支持版本或空仓库路径都会被明确拒绝。
+    #[test]
+    fn rejects_unsupported_or_empty_machine_config() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        fs::write(
+            directory.path().join("config.json"),
+            br#"{"configVersion":2,"repositoryPath":"C:\\data"}"#,
+        )
+        .expect("应能写入版本错误配置");
+        assert_eq!(
+            load_config(directory.path())
+                .expect_err("未知版本应被拒绝")
+                .code,
+            "CONFIG_INVALID"
+        );
+
+        fs::write(
+            directory.path().join("config.json"),
+            br#"{"configVersion":1,"repositoryPath":"   "}"#,
+        )
+        .expect("应能写入空路径配置");
+        assert_eq!(
+            load_config(directory.path())
+                .expect_err("空路径应被拒绝")
+                .code,
+            "CONFIG_INVALID"
         );
     }
 }

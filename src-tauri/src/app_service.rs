@@ -1,5 +1,5 @@
-//! 文件职责：编排 S1 的机器配置、仓库校验、命令文档加载与空数据初始化。
-//! 主要内容：向 Tauri 命令提供稳定用例接口，并生成前端一次性消费的完整快照。
+//! 文件职责：编排机器配置、命令文档持久化与安全 Git 同步用例。
+//! 主要内容：向 Tauri 命令提供稳定接口，并生成前端一次性消费的完整快照。
 //! 重要约束：启动恢复失败返回错误快照；主动连接失败返回 `Err`，两者都不覆盖原数据。
 
 use crate::backup_store::backup_document;
@@ -57,10 +57,10 @@ impl AppService {
         Ok(snapshot)
     }
 
-    /// 在外部基线未变化的前提下备份并原子保存完整命令文档。
+    /// 在外部基线未变化且 Git 状态可确认的前提下，备份并原子保存完整命令文档。
     ///
     /// 参数：`expected_hash` 必须来自最近一次成功快照；不一致时拒绝覆盖磁盘。
-    /// 副作用：在机器配置目录创建写入前备份，并替换仓库中的 `commands.json`。
+    /// 副作用：写入前完成所有可能失败的 Git 查询，再创建备份并替换仓库中的 `commands.json`。
     pub fn save_document(
         &self,
         document: CommandDocument,
@@ -87,12 +87,16 @@ impl AppService {
             ));
         }
 
+        // Git 状态必须在任何磁盘副作用之前确认；否则写入成功后的查询失败会让界面错误回滚。
+        let dirty_before_save = repository_has_local_changes(&repository.root)?;
+
         let bytes = serialize_document(&document)?;
         backup_document(&self.config_directory, &repository.root, &document_path)?;
         atomic_write(&document_path, &bytes)?;
 
         let (saved_document, saved_hash) = load_document(&document_path)?;
-        let dirty = repository_has_local_changes(&repository.root)?;
+        // 写入后不再调用 Git；原状态已脏或文件字节发生变化，都足以确定需要后续推送。
+        let dirty = dirty_before_save || saved_hash != current_hash;
         Ok(success_snapshot(
             repository,
             saved_document,
@@ -102,9 +106,9 @@ impl AppService {
         ))
     }
 
-    /// 从当前分支上游安全拉取并返回重新校验后的完整快照。
+    /// 从当前分支上游安全拉取，并使用同一固定提交已校验的文档构造快照。
     ///
-    /// 副作用：会刷新 `origin` 远端引用；只有远端候选文档有效且关系可快进时才改变工作区。
+    /// 副作用：会刷新 `origin` 远端引用；快进后不再运行可能把成功误报成失败的磁盘或状态查询。
     pub fn pull_repository(&self) -> Result<AppSnapshot, AppError> {
         let config = load_config(&self.config_directory)?.ok_or_else(|| {
             AppError::new(
@@ -115,11 +119,16 @@ impl AppService {
             )
         })?;
         let repository = validate_repository(Path::new(&config.repository_path))?;
-        let outcome = git_pull_repository(&repository.root)?;
         let document_path = repository.root.join("commands.json");
-        let (document, document_hash) = load_document(&document_path)?;
-        let dirty = repository_has_local_changes(&repository.root)?;
-        let mut snapshot = success_snapshot(repository, document, document_hash, false, dirty);
+        let baseline_document = load_document(&document_path)?;
+        let outcome = git_pull_repository(&repository.root)?;
+        // Blob 只负责合并前校验；快进后必须重新读取工作树，以包含 EOL 转换后的真实字节哈希。
+        let (document, document_hash) = if outcome.updated {
+            load_document(&document_path)?
+        } else {
+            baseline_document
+        };
+        let mut snapshot = success_snapshot(repository, document, document_hash, false, false);
         snapshot.status_message = if outcome.updated {
             "已拉取并加载远端最新命令。"
         } else {
@@ -131,7 +140,7 @@ impl AppService {
 
     /// 保存范围校验通过后，只提交 `commands.json` 并执行普通推送。
     ///
-    /// 副作用：可能创建一个本地 Git 提交并访问 `origin`；任何失败均保留本地文件和已有提交。
+    /// 副作用：可能创建一个本地 Git 提交并访问 `origin`；成功推送后不再执行状态确认查询。
     pub fn push_repository(&self) -> Result<AppSnapshot, AppError> {
         let config = load_config(&self.config_directory)?.ok_or_else(|| {
             AppError::new(
@@ -145,8 +154,7 @@ impl AppService {
         let document_path = repository.root.join("commands.json");
         let (document, document_hash) = load_document(&document_path)?;
         let outcome = git_push_repository(&repository.root)?;
-        let dirty = repository_has_local_changes(&repository.root)?;
-        let mut snapshot = success_snapshot(repository, document, document_hash, false, dirty);
+        let mut snapshot = success_snapshot(repository, document, document_hash, false, false);
         snapshot.status_message = match (outcome.committed, outcome.pushed) {
             (true, true) => "本地修改已提交并推送。",
             (false, true) => "已有本地提交已推送。",
@@ -262,12 +270,18 @@ fn error_snapshot(repository_path: Option<String>, error: AppError) -> AppSnapsh
 
 #[cfg(test)]
 mod tests {
-    //! 测试职责：使用临时裸仓库和本地克隆验证首次连接、空初始化和重启恢复闭环。
+    //! 测试职责：使用临时裸仓库和本地克隆验证数据持久化、同步与失败恢复闭环。
 
     use super::AppService;
+    use crate::command_store::{load_document, serialize_document};
+    use crate::config_store::{save_config, AppConfig};
+    use crate::git_repository::repository_has_local_changes;
     use crate::model::SyncState;
     use crate::model::{CommandCategory, CommandDocument, CommandEntry};
     use std::fs;
+    use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -300,6 +314,16 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// 判断测试 Git 命令是否成功，供需要验证暂存区退出码的用例使用。
+    fn git_succeeds(directory: &Path, arguments: &[&str]) -> bool {
+        Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .status()
+            .expect("测试环境应能启动系统 Git")
+            .success()
     }
 
     /// 创建包含初始提交和上游的远端与工作克隆。
@@ -365,6 +389,24 @@ mod tests {
         git(repository, &["push"]);
     }
 
+    /// 在裸远端安装确定性拒绝 hook；Unix 需要显式补充可执行权限。
+    fn install_rejecting_pre_receive_hook(remote: &Path) {
+        let hook = remote.join("hooks").join("pre-receive");
+        fs::write(
+            &hook,
+            "#!/bin/sh\necho 'CommandShelf deterministic rejection' >&2\nexit 1\n",
+        )
+        .expect("应能写入远端拒绝 hook");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&hook)
+                .expect("应能读取 hook 权限")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook, permissions).expect("应能设置 hook 可执行权限");
+        }
+    }
+
     /// 验证首次运行不会把原型样例当成正式数据。
     #[test]
     fn first_run_is_unconfigured_and_empty() {
@@ -376,6 +418,52 @@ mod tests {
         assert_eq!(snapshot.sync_state, SyncState::Unconfigured);
         assert!(snapshot.document.categories.is_empty());
         assert!(snapshot.repository_path.is_none());
+    }
+
+    /// 验证机器配置损坏时启动快照保留结构化错误，而不是伪装成首次运行。
+    #[test]
+    fn reports_invalid_machine_config_on_startup() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let config_directory = directory.path().join("config");
+        fs::create_dir_all(&config_directory).expect("应能创建配置目录");
+        fs::write(config_directory.join("config.json"), "{invalid").expect("应能写入损坏配置");
+
+        let snapshot = AppService::new(config_directory).load_app();
+
+        assert_eq!(snapshot.sync_state, SyncState::Error);
+        assert!(snapshot.repository_path.is_none());
+        assert_eq!(
+            snapshot.error.expect("错误快照应携带结构化原因").code,
+            "CONFIG_INVALID"
+        );
+    }
+
+    /// 验证已保存仓库被移动后仍显示原路径和错误，便于用户重新选择而不误判为空数据。
+    #[test]
+    fn reports_stale_repository_path_on_startup() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let config_directory = directory.path().join("config");
+        let missing_repository = directory.path().join("moved-repository");
+        save_config(
+            &config_directory,
+            &AppConfig {
+                config_version: 1,
+                repository_path: missing_repository.to_string_lossy().to_string(),
+            },
+        )
+        .expect("测试配置应能保存");
+
+        let snapshot = AppService::new(config_directory).load_app();
+
+        assert_eq!(snapshot.sync_state, SyncState::Error);
+        assert_eq!(
+            snapshot.repository_path.as_deref(),
+            Some(missing_repository.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            snapshot.error.expect("失效路径应携带结构化原因").code,
+            "PATH_NOT_FOUND"
+        );
     }
 
     /// 验证连接仓库会初始化空文档，并可由新服务实例恢复。
@@ -456,8 +544,8 @@ mod tests {
         );
     }
 
-    /// 构造 S2 保存测试使用的一条命令文档。
-    fn edited_document() -> CommandDocument {
+    /// 构造保存测试使用的一条命令文档；标题参数便于制造序列化后等长的内容变化。
+    fn edited_document_with_title(title: &str) -> CommandDocument {
         CommandDocument {
             schema_version: 1,
             categories: vec![CommandCategory {
@@ -467,7 +555,7 @@ mod tests {
                 icon: "terminal".to_string(),
                 commands: vec![CommandEntry {
                     id: "command-process".to_string(),
-                    title: "查看进程".to_string(),
+                    title: title.to_string(),
                     command_text: "ps aux".to_string(),
                     description: "查看全部进程".to_string(),
                     usage: "ps aux".to_string(),
@@ -478,6 +566,11 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// 构造 S2 保存测试使用的默认命令文档。
+    fn edited_document() -> CommandDocument {
+        edited_document_with_title("查看进程")
     }
 
     /// 验证编辑文档会备份、原子保存并在重启后恢复，同时拒绝陈旧哈希覆盖。
@@ -513,6 +606,75 @@ mod tests {
             .filter_map(Result::ok)
             .count();
         assert_eq!(backup_count, 1, "首次编辑应创建一份写入前备份");
+    }
+
+    /// 验证写入后即使 Git 状态已不可读，保存仍返回与磁盘一致的新文档和哈希。
+    #[test]
+    fn preserves_disk_baseline_when_git_status_check_fails() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let original_document = edited_document_with_title("查看进程");
+        fs::write(
+            repository.join("commands.json"),
+            serialize_document(&original_document).expect("原始文档应能序列化"),
+        )
+        .expect("应能写入原始文档");
+        fs::write(
+            repository.join(".gitattributes"),
+            "commands.json filter=break-status\n",
+        )
+        .expect("应能写入测试属性");
+        git(&repository, &["add", "commands.json", ".gitattributes"]);
+        git(&repository, &["config", "user.name", "CommandShelf Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "commandshelf-test@example.invalid"],
+        );
+        git(&repository, &["commit", "-m", "加入状态失败测试基线"]);
+        git(&repository, &["push"]);
+
+        let config_directory = directory.path().join("config");
+        let service = AppService::new(config_directory.clone());
+        let connected = service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("过滤器失效前应能连接仓库");
+        let original_hash = connected.document_hash.expect("连接快照应包含哈希");
+        // `required` clean filter 只在 Git 读取变化后的工作区内容时失败；等长标题确保状态检查进入过滤路径。
+        git(
+            &repository,
+            &["config", "filter.break-status.clean", "false"],
+        );
+        git(
+            &repository,
+            &["config", "filter.break-status.required", "true"],
+        );
+        let replacement = edited_document_with_title("检查进程");
+        let saved = service
+            .save_document(replacement.clone(), &original_hash)
+            .expect("写入前状态可确认时，后续状态故障不得把成功保存改成失败");
+        let status_error = repository_has_local_changes(&repository)
+            .expect_err("变化后的文档应稳定触发测试 clean filter 故障");
+
+        assert_eq!(status_error.code, "GIT_FAILED");
+        assert_eq!(saved.sync_state, SyncState::Dirty);
+        assert_eq!(saved.document, replacement);
+        let (disk_document, disk_hash) =
+            load_document(&repository.join("commands.json")).expect("新文档应完整写入磁盘");
+        assert_eq!(saved.document, disk_document);
+        assert_eq!(saved.document_hash.as_deref(), Some(disk_hash.as_str()));
+        assert_ne!(disk_hash, original_hash);
+
+        git(
+            &repository,
+            &["config", "--unset", "filter.break-status.required"],
+        );
+        git(
+            &repository,
+            &["config", "--unset", "filter.break-status.clean"],
+        );
+        let restarted = AppService::new(config_directory).load_app();
+        assert_eq!(restarted.document, disk_document);
+        assert_eq!(restarted.document_hash.as_deref(), Some(disk_hash.as_str()));
     }
 
     /// 验证另一克隆推送有效文档后，本地只通过快进更新并加载新内容。
@@ -563,6 +725,82 @@ mod tests {
             git_output(&repository, &["rev-parse", "HEAD"]),
             git_output(&repository, &["rev-parse", "@{u}"])
         );
+    }
+
+    /// 验证 CRLF 工作树使用实际文件哈希作为拉取基线，拉取后可立即保存。
+    #[test]
+    fn uses_worktree_hash_after_pull_with_crlf_checkout() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        fs::write(
+            repository.join(".gitattributes"),
+            "commands.json text eol=crlf\n",
+        )
+        .expect("应能写入 EOL 属性");
+        fs::write(
+            repository.join("commands.json"),
+            document_json("本地 CRLF 基线"),
+        )
+        .expect("应能写入初始文档");
+        git(&repository, &["config", "user.name", "CommandShelf Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "commandshelf-test@example.invalid"],
+        );
+        git(&repository, &["add", ".gitattributes", "commands.json"]);
+        git(&repository, &["commit", "-m", "加入 CRLF 数据基线"]);
+        git(&repository, &["push"]);
+        fs::remove_file(repository.join("commands.json")).expect("应能移除工作树副本");
+        git(&repository, &["checkout", "--", "commands.json"]);
+
+        let service = AppService::new(directory.path().join("config"));
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("CRLF 工作树应能连接");
+        let producer = directory.path().join("producer-crlf");
+        git(
+            directory.path(),
+            &[
+                "clone",
+                directory
+                    .path()
+                    .join("remote.git")
+                    .to_string_lossy()
+                    .as_ref(),
+                "producer-crlf",
+            ],
+        );
+        fs::write(
+            producer.join("commands.json"),
+            document_json("来自远端的 CRLF 命令"),
+        )
+        .expect("应能写入远端候选文档");
+        commit_and_push_document(&producer, "更新 CRLF 命令数据");
+
+        let pulled = service.pull_repository().expect("有效 CRLF 候选应能快进");
+        let worktree_bytes =
+            fs::read(repository.join("commands.json")).expect("快进后应能读取工作树文档");
+        assert!(
+            worktree_bytes.windows(2).any(|pair| pair == b"\r\n"),
+            "测试必须实际覆盖 CRLF 工作树字节"
+        );
+        let (_, worktree_hash) =
+            load_document(&repository.join("commands.json")).expect("工作树文档应有效");
+        assert_eq!(
+            pulled.document_hash.as_deref(),
+            Some(worktree_hash.as_str()),
+            "pull 快照必须返回工作树实际字节哈希，而不是 Git blob 哈希"
+        );
+
+        let mut edited = pulled.document.clone();
+        edited.categories[0].commands[0].title = "拉取后立即保存".to_string();
+        let saved = service
+            .save_document(
+                edited.clone(),
+                pulled.document_hash.as_deref().expect("拉取快照应有哈希"),
+            )
+            .expect("使用 pull 返回哈希立即保存时不应误报 BASELINE_CHANGED");
+        assert_eq!(saved.document, edited);
     }
 
     /// 验证未提交本地文件会在 fetch 前停止，数据文件和提交均保持不变。
@@ -689,6 +927,148 @@ mod tests {
         assert_eq!(no_op.sync_state, SyncState::Synced);
     }
 
+    /// 验证真实本地连接拒绝只让推送失败，文档字节、哈希、Git 状态与重启数据保持不变。
+    #[test]
+    fn preserves_document_when_loopback_remote_refuses_connection() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let config_directory = directory.path().join("config");
+        let service = AppService::new(config_directory.clone());
+        let connected = service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("首次连接应成功");
+        let saved = service
+            .save_document(
+                edited_document(),
+                connected
+                    .document_hash
+                    .as_deref()
+                    .expect("连接快照应有哈希"),
+            )
+            .expect("本地文档保存应成功");
+        let saved_hash = saved.document_hash.clone().expect("保存快照应有哈希");
+        let before_bytes = fs::read(repository.join("commands.json")).expect("应能读取保存文档");
+        let before_head = git_output(&repository, &["rev-parse", "HEAD"]);
+        let before_status = git_output(
+            &repository,
+            &["status", "--porcelain=v1", "--", "commands.json"],
+        );
+        let original_origin = git_output(&repository, &["remote", "get-url", "origin"]);
+
+        // 先由系统分配空闲端口再关闭监听器，紧接着访问可稳定得到本机连接拒绝而不依赖互联网。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("应能分配本地测试端口");
+        let port = listener.local_addr().expect("应能读取本地端口").port();
+        drop(listener);
+        let refused_origin = format!("http://127.0.0.1:{port}/commands.git");
+        git(
+            &repository,
+            &["remote", "set-url", "origin", refused_origin.as_str()],
+        );
+        let error = service
+            .push_repository()
+            .expect_err("连接拒绝时真实 Git push 流程应停止");
+
+        assert_eq!(error.code, "GIT_NETWORK_FAILED");
+        assert_eq!(
+            fs::read(repository.join("commands.json")).unwrap(),
+            before_bytes
+        );
+        assert_eq!(git_output(&repository, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(
+            git_output(
+                &repository,
+                &["status", "--porcelain=v1", "--", "commands.json"],
+            ),
+            before_status
+        );
+        let (disk_document, disk_hash) =
+            load_document(&repository.join("commands.json")).expect("失败后文档仍应有效");
+        assert_eq!(disk_document, saved.document);
+        assert_eq!(disk_hash, saved_hash);
+
+        git(
+            &repository,
+            &["remote", "set-url", "origin", original_origin.as_str()],
+        );
+        let restarted = AppService::new(config_directory).load_app();
+        assert_eq!(restarted.sync_state, SyncState::Dirty);
+        assert_eq!(restarted.document, disk_document);
+        assert_eq!(restarted.document_hash.as_deref(), Some(disk_hash.as_str()));
+    }
+
+    /// 验证 pre-receive 拒绝后只保留本地提交，磁盘/hash 与重启快照仍完全一致。
+    #[test]
+    fn preserves_document_and_local_commit_after_pre_receive_rejection() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let remote = directory.path().join("remote.git");
+        git(&repository, &["config", "user.name", "CommandShelf Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "commandshelf-test@example.invalid"],
+        );
+        let config_directory = directory.path().join("config");
+        let service = AppService::new(config_directory.clone());
+        let connected = service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("首次连接应成功");
+        let saved = service
+            .save_document(
+                edited_document(),
+                connected
+                    .document_hash
+                    .as_deref()
+                    .expect("连接快照应有哈希"),
+            )
+            .expect("本地文档保存应成功");
+        let saved_hash = saved.document_hash.clone().expect("保存快照应有哈希");
+        let before_bytes = fs::read(repository.join("commands.json")).expect("应能读取保存文档");
+        let before_local_head = git_output(&repository, &["rev-parse", "HEAD"]);
+        let before_remote_head = git_output(&remote, &["rev-parse", "HEAD"]);
+        install_rejecting_pre_receive_hook(&remote);
+
+        let error = service
+            .push_repository()
+            .expect_err("远端 hook 应拒绝真实推送");
+
+        assert_eq!(error.code, "GIT_PUSH_REJECTED");
+        assert_eq!(
+            fs::read(repository.join("commands.json")).unwrap(),
+            before_bytes
+        );
+        assert_ne!(
+            git_output(&repository, &["rev-parse", "HEAD"]),
+            before_local_head,
+            "自动提交应作为可重试的本地进度保留"
+        );
+        assert_eq!(
+            git_output(&remote, &["rev-parse", "HEAD"]),
+            before_remote_head,
+            "拒绝 hook 不得推进远端"
+        );
+        assert_eq!(
+            git_output(
+                &repository,
+                &["status", "--porcelain=v1", "--", "commands.json"],
+            ),
+            "",
+            "已提交的数据文件不应残留工作区变化"
+        );
+        assert_eq!(
+            git_output(&repository, &["rev-list", "--count", "@{u}..HEAD"]),
+            "1"
+        );
+        let (disk_document, disk_hash) =
+            load_document(&repository.join("commands.json")).expect("拒绝后文档仍应有效");
+        assert_eq!(disk_document, saved.document);
+        assert_eq!(disk_hash, saved_hash);
+
+        let restarted = AppService::new(config_directory).load_app();
+        assert_eq!(restarted.sync_state, SyncState::Dirty);
+        assert_eq!(restarted.document, disk_document);
+        assert_eq!(restarted.document_hash.as_deref(), Some(disk_hash.as_str()));
+    }
+
     /// 验证远端领先时推送不会提交或覆盖本地未提交数据。
     #[test]
     fn stops_push_before_commit_when_remote_is_ahead() {
@@ -768,5 +1148,53 @@ mod tests {
 
         assert_eq!(error.code, "WORKTREE_DIRTY");
         assert_eq!(git_output(&repository, &["rev-parse", "HEAD"]), before_head);
+    }
+
+    /// 验证提交身份缺失时撤销应用暂存，修复身份后可直接重试且数据不丢失。
+    #[test]
+    fn unstages_document_after_identity_failure_and_allows_retry() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        let service = AppService::new(directory.path().join("config"));
+        let connected = service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("首次连接应成功");
+        let saved = service
+            .save_document(
+                edited_document(),
+                connected
+                    .document_hash
+                    .as_deref()
+                    .expect("连接快照应有哈希"),
+            )
+            .expect("本地数据保存应成功");
+        let before_failure =
+            fs::read(repository.join("commands.json")).expect("应能读取失败前文档");
+
+        // 空的仓库级身份覆盖可能存在的全局身份，稳定触发 Git 身份失败分支。
+        git(&repository, &["config", "user.name", ""]);
+        git(&repository, &["config", "user.email", ""]);
+        let error = service
+            .push_repository()
+            .expect_err("缺少有效提交身份时应停止推送");
+
+        assert_eq!(error.code, "GIT_IDENTITY_REQUIRED");
+        assert!(
+            git_succeeds(&repository, &["diff", "--cached", "--quiet"]),
+            "应用创建的暂存必须在提交失败后撤销"
+        );
+        assert_eq!(
+            fs::read(repository.join("commands.json")).expect("本地文档应继续存在"),
+            before_failure
+        );
+
+        git(&repository, &["config", "user.name", "CommandShelf Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "commandshelf-test@example.invalid"],
+        );
+        let retried = service.push_repository().expect("修复身份后应可直接重试");
+        assert_eq!(retried.sync_state, SyncState::Synced);
+        assert_eq!(retried.document, saved.document);
     }
 }

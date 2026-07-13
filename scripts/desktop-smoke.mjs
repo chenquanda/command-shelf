@@ -1,14 +1,15 @@
 /**
- * 文件职责：通过 WebView2 DevTools 协议验证 CommandShelf S1 的真实桌面入口。
- * 主要内容：连接正在运行的 Tauri 页面、提交仓库表单、检查界面与后端快照并保存截图。
+ * 文件职责：通过 WebView2 DevTools 协议验证 CommandShelf S1～S5 的真实桌面入口。
+ * 主要内容：连接正在运行的 Tauri 页面，检查仓库、编辑、同步、字段保真和故障恢复并保存截图。
  * 重要约束：脚本只面向隔离测试环境，不创建仓库、不修改正式 APPDATA，也不访问互联网。
  */
 
 import fs from "node:fs/promises";
+import { spawn } from "node:child_process";
 
 /** DevTools 端口，由启动测试应用时的 WebView2 参数决定。 */
 const port = Number.parseInt(process.argv[2] || "9223", 10);
-/** 验证模式：`connect` 走表单连接，`restart` 只检查重启恢复。 */
+/** 验证模式：由调用方选择一个已准备好隔离数据的端到端场景。 */
 const mode = process.argv[3] || "connect";
 /** connect 模式使用的临时本地 Git 仓库根路径。 */
 const repositoryPath = process.argv[4] || "";
@@ -22,6 +23,38 @@ const screenshotPath = process.argv[5] || "S1桌面验证.png";
  */
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/**
+ * 在隔离测试仓库中执行无 Shell 的系统 Git，用于核对暂存区并修复测试身份。
+ * @param {string} directory 已由桌面后端确认的临时仓库根目录。
+ * @param {string[]} gitArguments 固定测试场景所需的 Git 参数数组。
+ * @param {number[]} acceptedCodes 被视为预期结果的退出码。
+ * @returns {Promise<{code:number, stdout:string, stderr:string}>} 有限测试命令结果。
+ */
+async function runGit(directory, gitArguments, acceptedCodes = [0]) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", gitArguments, {
+      cwd: directory,
+      windowsHide: true,
+      shell: false,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never" },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      if (stdout.length < 65536) stdout += chunk.toString().slice(0, 65536 - stdout.length);
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 65536) stderr += chunk.toString().slice(0, 65536 - stderr.length);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const result = { code: code ?? -1, stdout: stdout.trim(), stderr: stderr.trim() };
+      if (acceptedCodes.includes(result.code)) resolve(result);
+      else reject(new Error(`git ${gitArguments.join(" ")} 失败：${result.stderr || `退出码 ${result.code}`}`));
+    });
+  });
 }
 
 /**
@@ -138,6 +171,7 @@ async function collectUi(send) {
       status: document.getElementById('sync-status-label').textContent,
       statusMessage: document.getElementById('sync-meta').textContent,
       repository: document.getElementById('repository-button').textContent,
+      repositoryDisabled: document.getElementById('repository-button').disabled,
       emptyTitle: document.querySelector('#empty-state h2').textContent,
       commandTitles: [...document.querySelectorAll('.command-title')].map((node) => node.textContent),
       addCategoryDisabled: document.getElementById('add-category-button').disabled,
@@ -185,8 +219,32 @@ async function addCommandThroughDrawer(send, entry) {
  * @returns {Promise<void>} PNG 写入指定路径后结束。
  */
 async function saveScreenshot(send, outputPath = screenshotPath) {
-  const screenshot = await send("Page.captureScreenshot", { format: "png" });
+  // WebView2 在后台窗口更新错误提示时可能延迟合成，先激活页面并等待一帧稳定画面。
+  await send("Page.bringToFront");
+  await delay(250);
+  const screenshot = await send("Page.captureScreenshot", { format: "png", fromSurface: true });
   await fs.writeFile(outputPath, Buffer.from(screenshot.data, "base64"));
+}
+
+/**
+ * 通过正式仓库对话框连接调用方准备好的隔离 Git 克隆。
+ * @param {Function} send CDP 命令发送函数。
+ * @returns {Promise<void>} 表单提交完成；具体成功状态由场景继续等待和断言。
+ */
+async function connectRepositoryThroughDialog(send) {
+  if (!repositoryPath) throw new Error(`${mode} 模式必须提供仓库路径`);
+  const escapedPath = JSON.stringify(repositoryPath);
+  await evaluate(
+    send,
+    `(() => {
+      document.getElementById('repository-button').click();
+      const input = document.getElementById('repository-path-input');
+      input.value = ${escapedPath};
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('repository-form').requestSubmit();
+      return true;
+    })()`,
+  );
 }
 
 /**
@@ -201,18 +259,7 @@ async function verifyEmptyRepository(send) {
       "document.getElementById('sync-status-label')?.textContent === '未选择仓库'",
       "首次启动进入未配置状态",
     );
-    const escapedPath = JSON.stringify(repositoryPath);
-    await evaluate(
-      send,
-      `(() => {
-        document.getElementById('repository-button').click();
-        const input = document.getElementById('repository-path-input');
-        input.value = ${escapedPath};
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        document.getElementById('repository-form').requestSubmit();
-        return true;
-      })()`,
-    );
+    await connectRepositoryThroughDialog(send);
   }
 
   await waitForCondition(
@@ -505,6 +552,178 @@ async function verifyPushRemoteAhead(send) {
   return { protectedUi, protectedBackend };
 }
 
+/**
+ * 验证损坏机器配置或失效仓库路径在启动后显示持久错误，而不是伪装成未配置空数据。
+ * @param {Function} send CDP 命令发送函数。
+ * @returns {Promise<object>} 启动错误的界面与后端证据。
+ */
+async function verifyStartupError(send) {
+  await waitForCondition(
+    send,
+    "document.getElementById('sync-status-label')?.textContent === '同步失败'",
+    "启动错误进入持久失败状态",
+  );
+  const ui = await collectUi(send);
+  const backend = await evaluate(send, "window.__TAURI__.core.invoke('load_app')");
+  const acceptedCodes = new Set(["CONFIG_INVALID", "PATH_NOT_FOUND"]);
+  if (!acceptedCodes.has(backend.error?.code)) {
+    throw new Error(`启动错误没有保留结构化原因：${JSON.stringify(backend)}`);
+  }
+  if (ui.repositoryDisabled || !ui.addCategoryDisabled || !ui.addCommandDisabled || !ui.pullDisabled || !ui.pushDisabled) {
+    throw new Error(`失效配置仍开放了数据或同步写入口：${JSON.stringify(ui)}`);
+  }
+  return { ui, backend };
+}
+
+/**
+ * 验证只改标题时的字段保真、同步中禁改与复制可用，以及 Git 身份修复后的直接重试。
+ * @param {Function} send CDP 命令发送函数。
+ * @returns {Promise<object>} S5 数据保真、互斥与恢复证据。
+ */
+async function verifyHardeningFlow(send) {
+  if (await evaluate(send, "document.getElementById('sync-status-label')?.textContent === '未选择仓库'")) {
+    await connectRepositoryThroughDialog(send);
+  }
+  await waitForCondition(
+    send,
+    "document.getElementById('sync-status-label')?.textContent === '已同步' && document.querySelectorAll('.command-title').length === 1",
+    "S5 从包含一条完整命令的干净仓库开始",
+  );
+  const before = await evaluate(send, "window.__TAURI__.core.invoke('load_app')");
+  const beforeCommand = before.document?.categories?.[0]?.commands?.[0];
+  if (!beforeCommand) throw new Error(`S5 测试仓库缺少完整命令：${JSON.stringify(before)}`);
+  const editedTitle = beforeCommand.title === "只修改标题后的磁盘命令"
+    ? "只修改标题后的磁盘命令（复验）"
+    : "只修改标题后的磁盘命令";
+  const serializedEditedTitle = JSON.stringify(editedTitle);
+
+  await evaluate(
+    send,
+    `(() => {
+      document.querySelector('[data-edit-id]').click();
+      document.getElementById('command-title-input').value = ${serializedEditedTitle};
+      document.getElementById('command-form').requestSubmit();
+      return true;
+    })()`,
+  );
+  await waitForCondition(
+    send,
+    `document.getElementById('sync-status-label')?.textContent === '本地有修改' && document.querySelector('.command-title')?.textContent === ${serializedEditedTitle}`,
+    "只修改标题并完成本地保存",
+  );
+  const preserved = await evaluate(send, "window.__TAURI__.core.invoke('load_app')");
+  const preservedCommand = preserved.document.categories[0].commands[0];
+  for (const field of ["description", "notes", "usage", "riskNote"]) {
+    if (preservedCommand[field] !== beforeCommand[field]) {
+      throw new Error(`只改标题破坏了 ${field}：${JSON.stringify({ before: beforeCommand, after: preservedCommand })}`);
+    }
+  }
+
+  const lockState = await evaluate(
+    send,
+    `(() => {
+      document.querySelector('[data-edit-id]').click();
+      window.__s5CopiedValues = [];
+      copyText = async (text) => { window.__s5CopiedValues.push(text); };
+      syncState.operation = 'pull';
+      syncState.error = null;
+      renderSync();
+      const state = {
+        ariaBusy: document.getElementById('sync-panel').getAttribute('aria-busy'),
+        status: document.getElementById('sync-status-label').textContent,
+        addCategoryDisabled: document.getElementById('add-category-button').disabled,
+        addCommandDisabled: document.getElementById('add-command-button').disabled,
+        editDisabled: document.querySelector('[data-edit-id]').disabled,
+        draggable: document.querySelector('[data-command-id]').draggable,
+        titleDisabled: document.getElementById('command-title-input').disabled,
+        saveDisabled: document.getElementById('drawer-save').disabled,
+        cancelDisabled: document.getElementById('drawer-cancel').disabled,
+        copyDisabled: document.querySelector('[data-copy-id]').disabled
+      };
+      document.querySelector('[data-copy-id]').click();
+      document.getElementById('command-title-input').value = '同步期间不应保存';
+      document.getElementById('command-form').requestSubmit();
+      state.formError = document.getElementById('form-error').textContent;
+      return state;
+    })()`,
+  );
+  await waitForCondition(send, "window.__s5CopiedValues?.length === 1", "同步期间仍可复制命令");
+  const copiedValues = await evaluate(send, "window.__s5CopiedValues");
+  const expectedLockState = lockState.ariaBusy === "true"
+    && lockState.status === "正在拉取…"
+    && lockState.addCategoryDisabled
+    && lockState.addCommandDisabled
+    && lockState.editDisabled
+    && !lockState.draggable
+    && lockState.titleDisabled
+    && lockState.saveDisabled
+    && !lockState.cancelDisabled
+    && !lockState.copyDisabled
+    && lockState.formError.includes("等待操作结束");
+  if (!expectedLockState || copiedValues[0] !== beforeCommand.command) {
+    throw new Error(`同步互斥或只读能力不符合预期：${JSON.stringify({ lockState, copiedValues })}`);
+  }
+  const lockedBackend = await evaluate(send, "window.__TAURI__.core.invoke('load_app')");
+  if (lockedBackend.document.categories[0].commands[0].title !== editedTitle) {
+    throw new Error(`同步期间表单绕过了禁改保护：${JSON.stringify(lockedBackend)}`);
+  }
+  await evaluate(
+    send,
+    `(() => {
+      syncState.operation = null;
+      syncState.error = null;
+      syncState.statusMessage = '本地修改已保留，等待推送。';
+      closeDrawer();
+      render();
+      return true;
+    })()`,
+  );
+
+  await runGit(before.repositoryPath, ["config", "user.name", ""]);
+  await runGit(before.repositoryPath, ["config", "user.email", ""]);
+  await evaluate(send, "document.getElementById('push-button').click(); true");
+  await waitForCondition(
+    send,
+    "document.getElementById('sync-status-label')?.textContent === '同步失败' && document.getElementById('sync-meta')?.textContent.includes('Git user.name')",
+    "缺少 Git 身份时安全停止",
+  );
+  const identityFailureUi = await collectUi(send);
+  const identityFailureBackend = await evaluate(send, "window.__TAURI__.core.invoke('load_app')");
+  await runGit(before.repositoryPath, ["diff", "--cached", "--quiet"]);
+  if (identityFailureBackend.document.categories[0].commands[0].title !== editedTitle) {
+    throw new Error(`身份失败后本地数据发生变化：${JSON.stringify(identityFailureBackend)}`);
+  }
+  const failureScreenshotPath = screenshotPath.replace(/\.png$/i, "-身份失败.png");
+  await saveScreenshot(send, failureScreenshotPath);
+
+  await runGit(before.repositoryPath, ["config", "user.name", "CommandShelf Test"]);
+  await runGit(before.repositoryPath, ["config", "user.email", "commandshelf-test@example.invalid"]);
+  await evaluate(send, "document.getElementById('push-button').click(); true");
+  await waitForCondition(
+    send,
+    "document.getElementById('sync-status-label')?.textContent === '已同步' && document.getElementById('push-button').disabled",
+    "修复 Git 身份后直接重试成功",
+  );
+  const retriedUi = await collectUi(send);
+  const retriedBackend = await evaluate(send, "window.__TAURI__.core.invoke('load_app')");
+  if (retriedBackend.syncState !== "synced" || retriedBackend.document.categories[0].commands[0].title !== editedTitle) {
+    throw new Error(`身份修复后的推送结果不正确：${JSON.stringify(retriedBackend)}`);
+  }
+
+  return {
+    before,
+    editedTitle,
+    preserved,
+    lockState,
+    copiedValues,
+    identityFailureUi,
+    identityFailureBackend,
+    failureScreenshotPath,
+    retriedUi,
+    retriedBackend,
+  };
+}
+
 /** 执行指定模式的桌面验收并打印可归档证据。 */
 async function main() {
   if (!Number.isFinite(port)) throw new Error("DevTools 端口必须是数字");
@@ -516,9 +735,13 @@ async function main() {
     "pull-flow",
     "push-flow",
     "push-remote-ahead",
+    "startup-error",
+    "hardening-flow",
   ]);
   if (!knownModes.has(mode)) throw new Error(`未知验证模式：${mode}`);
-  if (mode === "connect" && !repositoryPath) throw new Error("connect 模式必须提供仓库路径");
+  if (new Set(["connect", "hardening-flow"]).has(mode) && !repositoryPath) {
+    throw new Error(`${mode} 模式必须提供仓库路径`);
+  }
 
   const target = await waitForPageTarget();
   const client = await connectCdp(target.webSocketDebuggerUrl);
@@ -541,7 +764,11 @@ async function main() {
             ? await verifyPullFlow(client.send)
             : mode === "push-flow"
               ? await verifyPushFlow(client.send)
-              : await verifyPushRemoteAhead(client.send);
+              : mode === "push-remote-ahead"
+                ? await verifyPushRemoteAhead(client.send)
+                : mode === "startup-error"
+                  ? await verifyStartupError(client.send)
+                  : await verifyHardeningFlow(client.send);
     if (!new Set(["local-edit", "pull-flow"]).has(mode)) await saveScreenshot(client.send);
     process.stdout.write(`${JSON.stringify({ mode, targetUrl: target.url, ...evidence, screenshotPath }, null, 2)}\n`);
   } finally {
