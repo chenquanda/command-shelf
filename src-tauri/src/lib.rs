@@ -14,7 +14,7 @@ mod model;
 mod process_runner;
 
 use app_service::AppService;
-use codex_cli::{detect_codex_cli, generate_command_draft_once, CodexCliStatus};
+use codex_cli::{detect_codex_cli, generate_command_draft_with_retry, CodexCliStatus};
 use config_store::default_config_directory;
 use error::AppError;
 use model::{AppSnapshot, CommandDocument, CommandDraft};
@@ -110,13 +110,13 @@ fn get_codex_cli_status() -> CodexCliStatus {
     detect_codex_cli()
 }
 
-/// 使用本机 Codex CLI 生成一次临时命令草稿，不保存到当前分类或数据文件。
+/// 使用本机 Codex CLI 生成临时命令草稿，不保存到当前分类或数据文件。
 ///
 /// 参数：`question` 只作为标准输入传给固定的只读、临时 Codex 会话。
-/// 副作用：可能访问 Codex 服务；绝不执行生成的命令，也不修改 `commands.json`。
+/// 副作用：响应无效时会新建一次会话重试；绝不执行生成命令或修改 `commands.json`。
 #[tauri::command]
 fn generate_command_draft(question: String) -> Result<CommandDraft, AppError> {
-    generate_command_draft_once(&question)
+    generate_command_draft_with_retry(&question)
 }
 
 /// 启动 Tauri 桌面应用并注册经过显式授权的最小命令集合。
