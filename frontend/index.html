@@ -1489,6 +1489,41 @@
     .command-item:last-child { border-bottom: 0; }
     .command-item:hover { border-color: var(--paper-line); box-shadow: none; }
 
+    /* 临时结果只改变视觉层级，不伪装成已经进入 commands.json 的正式命令。 */
+    .temporary-command-item {
+      border-top: 3px solid var(--olive);
+      background: #FCFBF5;
+    }
+
+    .temporary-command-item .command-detail { min-height: 0; }
+
+    .temporary-marker {
+      display: grid;
+      place-items: center;
+      width: 46px;
+      min-height: 30px;
+      color: var(--olive);
+      font-family: var(--font-display);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+    }
+
+    .temporary-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 21px;
+      margin-left: 8px;
+      padding: 0 7px;
+      border: 1px solid #C9CCB2;
+      border-radius: 999px;
+      background: var(--olive-soft);
+      color: var(--olive);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+    }
+
     .command-item.is-dragging { opacity: 0.48; }
     .command-item.is-drag-over { border-top: 2px solid var(--olive); }
 
@@ -2329,6 +2364,12 @@
     let codexReturnFocusTarget = null;
     /** 最近一次生成响应只保存在前端内存中；只有用户后续确认保存才允许进入正式分类。 */
     let temporaryGenerationResult = null;
+    /** 临时结果绑定生成时的分类，避免切换分类后把同一草稿误显示在其他列表。 */
+    let temporaryGenerationCategoryId = null;
+    /** 临时卡片默认完整展开；该状态只影响本次运行中的视图，不进入稳定数据文档。 */
+    let temporaryCommandExpanded = true;
+    /** 临时卡片使用固定视图 ID，确保展开控件与详情容器具有稳定的无障碍关联。 */
+    const TEMPORARY_COMMAND_VIEW_ID = "codex-temporary-result";
     const expandedCommandIds = new Set(["linux-1"]);
 
     /** Codex 对话框状态与仓库同步状态相互独立，生成过程不冒充数据保存或网络同步。 */
@@ -2805,11 +2846,22 @@
       codexState.generating = true;
       codexState.error = "";
       temporaryGenerationResult = null;
+      temporaryGenerationCategoryId = null;
+      renderWorkspace();
       renderCodexDialog();
+      /* 对话框阻止背景分类切换，但仍显式捕获归属，避免异步结果依赖完成时的可变界面状态。 */
+      const generationCategoryId = activeCategoryId;
       try {
         const result = await window.__TAURI__.core.invoke("generate_command_draft", { question });
         if (result?.status === "generated" && result.draft) {
           temporaryGenerationResult = result;
+          temporaryGenerationCategoryId = generationCategoryId;
+          temporaryCommandExpanded = true;
+          renderWorkspace();
+          closeCodexDialog();
+          window.requestAnimationFrame(() => {
+            document.getElementById("temporary-command-card")?.scrollIntoView({ block: "start" });
+          });
           showToastFeedback("Codex 临时命令已生成");
         } else if (result?.status === "manualEntryRequired") {
           temporaryGenerationResult = result;
@@ -2915,6 +2967,88 @@
       return `第 ${index + 1} 条，共 ${total} 条，“${command.title}”。${moveUpHint}；${moveDownHint}。`;
     }
 
+    /**
+     * 把成功生成的草稿渲染成当前分类顶部的完整临时卡片，不创建命令 ID 或正式数据副本。
+     * @param {object} category 当前活动分类，用于核对草稿归属。
+     * @returns {string} 可放入命令列表顶部的安全 HTML；没有匹配草稿时返回空字符串。
+     */
+    function renderTemporaryCommand(category) {
+      const result = temporaryGenerationResult;
+      if (result?.status !== "generated" || !result.draft || temporaryGenerationCategoryId !== category.id) return "";
+
+      const draft = result.draft;
+      const parameters = Array.isArray(draft.parameters) ? draft.parameters : [];
+      const parameterMarkup = parameters.length > 0
+        ? `<ul class="parameter-list">${parameters.map((parameter) => `
+            <li class="parameter-item">
+              <code class="parameter-name">${escapeHtml(parameter.name)}</code>
+              <span>${escapeHtml(parameter.description)}</span>
+            </li>
+          `).join("")}</ul>`
+        : '<p class="parameter-empty">这条命令没有需要额外说明的参数。</p>';
+      const notesMarkup = draft.notes
+        ? `<section class="detail-section">
+            <h3 class="detail-label">补充说明</h3>
+            <p class="detail-description">${escapeHtml(draft.notes)}</p>
+          </section>`
+        : "";
+      const riskMarkup = draft.riskNote
+        ? `<section class="detail-section">
+            <h3 class="detail-label">风险提示</h3>
+            <p class="detail-description">${escapeHtml(draft.riskNote)}</p>
+          </section>`
+        : "";
+
+      return `
+        <li class="command-item temporary-command-item" id="temporary-command-card" data-temporary-command="true">
+          <div class="command-header">
+            <button class="command-toggle" type="button" data-output-id="${TEMPORARY_COMMAND_VIEW_ID}" aria-expanded="${temporaryCommandExpanded}" aria-controls="output-panel-${TEMPORARY_COMMAND_VIEW_ID}" aria-label="${temporaryCommandExpanded ? "收起" : "展开"}${escapeHtml(draft.title)}临时结果详情">
+              ${icon("chevron")}
+            </button>
+            <span class="temporary-marker" aria-hidden="true">AI</span>
+            <div class="command-heading">
+              <h2 class="command-title">${escapeHtml(draft.title)}</h2>
+              <span class="temporary-badge">临时结果 · 尚未保存</span>
+              ${draft.riskNote ? '<span class="risk-badge">谨慎执行</span>' : ""}
+            </div>
+            <code class="code-box">${escapeHtml(draft.command)}</code>
+            <div class="command-actions">
+              <button class="action-button copy-button" type="button" data-copy-temporary-command="true" aria-label="复制${escapeHtml(draft.title)}" title="复制">
+                ${icon("copy")}<span class="visually-hidden">复制</span>
+              </button>
+            </div>
+          </div>
+          <div class="command-detail" id="output-panel-${TEMPORARY_COMMAND_VIEW_ID}" ${temporaryCommandExpanded ? "" : "hidden"}>
+            <div class="detail-column">
+              <section class="detail-section">
+                <h3 class="detail-label">命令说明</h3>
+                <p class="detail-description">${escapeHtml(draft.description || "暂未补充命令说明。")}</p>
+              </section>
+              <section class="detail-section">
+                <h3 class="detail-label">用法</h3>
+                <code class="usage-box">${escapeHtml(draft.usage || draft.command)}</code>
+              </section>
+              <section class="detail-section">
+                <h3 class="detail-label">参数说明</h3>
+                ${parameterMarkup}
+              </section>
+              ${notesMarkup}
+              ${riskMarkup}
+            </div>
+            <div class="detail-column output-column">
+              <h3 class="detail-label">参考输出</h3>
+              <pre class="output-example">${escapeHtml(draft.outputExample)}</pre>
+              <div class="output-footer">
+                <span>AI 生成内容，请在实际使用前自行确认</span>
+                <button class="action-button copy-output-button" type="button" data-copy-temporary-output="true">
+                  ${icon("copy")}<span>复制输出</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </li>`;
+    }
+
     /** 渲染当前分类的连续命令清单，并把展开条目组织为说明与输出双栏。 */
     function renderWorkspace() {
       const category = getActiveCategory();
@@ -2938,10 +3072,12 @@
       categoryTitle.textContent = category.name;
       categoryCount.textContent = `${category.commands.length} 条命令`;
       categoryDescription.textContent = category.description;
-      commandList.hidden = category.commands.length === 0;
-      emptyState.hidden = category.commands.length !== 0;
+      const temporaryCommandMarkup = renderTemporaryCommand(category);
+      const hasVisibleCommand = Boolean(temporaryCommandMarkup) || category.commands.length > 0;
+      commandList.hidden = !hasVisibleCommand;
+      emptyState.hidden = hasVisibleCommand;
 
-      commandList.innerHTML = category.commands.map((command, index) => {
+      commandList.innerHTML = temporaryCommandMarkup + category.commands.map((command, index) => {
         const isOutputExpanded = expandedCommandIds.has(command.id);
         const parameters = Array.isArray(command.parameters) ? command.parameters : [];
         const parameterMarkup = parameters.length > 0
@@ -3122,6 +3258,8 @@
       const outputButton = event.target.closest("[data-output-id]");
       const copyButton = event.target.closest("[data-copy-id]");
       const copyOutputButton = event.target.closest("[data-copy-output-id]");
+      const copyTemporaryCommandButton = event.target.closest("[data-copy-temporary-command]");
+      const copyTemporaryOutputButton = event.target.closest("[data-copy-temporary-output]");
       const editButton = event.target.closest("[data-edit-id]");
       const category = getActiveCategory();
 
@@ -3134,8 +3272,24 @@
         outputButton.setAttribute("aria-expanded", String(willExpand));
         outputButton.setAttribute("aria-label", `${willExpand ? "收起" : "展开"}${outputButton.closest(".command-item").querySelector(".command-title").textContent}详情`);
         output.hidden = !willExpand;
-        if (willExpand) expandedCommandIds.add(commandId);
+        if (commandId === TEMPORARY_COMMAND_VIEW_ID) {
+          temporaryCommandExpanded = willExpand;
+        } else if (willExpand) expandedCommandIds.add(commandId);
         else expandedCommandIds.delete(commandId);
+      }
+
+      if (copyTemporaryCommandButton || copyTemporaryOutputButton) {
+        const draft = temporaryGenerationResult?.status === "generated" ? temporaryGenerationResult.draft : null;
+        if (!draft || temporaryGenerationCategoryId !== category?.id) return;
+        try {
+          await copyText(copyTemporaryCommandButton ? draft.command : draft.outputExample);
+          showCopiedFeedback(
+            copyTemporaryCommandButton || copyTemporaryOutputButton,
+            copyTemporaryCommandButton ? "命令已复制" : "参考输出已复制"
+          );
+        } catch (error) {
+          showToastFeedback("复制失败，请手动选择内容", "error");
+        }
       }
 
       if (copyButton) {
