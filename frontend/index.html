@@ -1,7 +1,7 @@
 <!--
   文件职责：提供 CommandShelf 正式 Tauri 桌面前端，并保留浏览器独立预览能力。
-  主要内容：展示与维护真实命令文档、连接本地数据仓库，并呈现安全拉取、推送和失败恢复状态。
-  重要约束：桌面模式只能通过显式 Tauri 命令访问文件；同步期间禁止修改，但浏览、展开和复制保持可用。
+  主要内容：展示与维护真实命令文档、连接本地数据仓库，并通过本机 Codex CLI 生成临时命令草稿。
+  重要约束：桌面模式只能通过显式 Tauri 命令访问文件；Codex 结果只展示不执行，用户确认前不写入命令数据。
 -->
 <!doctype html>
 <html lang="zh-CN">
@@ -1410,6 +1410,39 @@
       font-size: 13px;
     }
 
+    /* 标题区把 AI 询问作为次级入口，避免与长期保存命令的主操作争夺视觉层级。 */
+    .workspace-actions {
+      display: flex;
+      flex: 0 0 auto;
+      align-items: flex-start;
+      gap: 10px;
+    }
+
+    .codex-entry-button {
+      min-width: 124px;
+      min-height: 50px;
+      margin-top: 8px;
+      padding: 0 18px;
+      border-color: var(--paper-line-strong);
+      border-radius: 5px;
+      background: var(--paper-raised);
+      color: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .codex-entry-button:hover:not(:disabled) {
+      border-color: var(--olive);
+      background: var(--olive-soft);
+      color: var(--olive);
+    }
+
+    .codex-entry-button:disabled {
+      cursor: not-allowed;
+      opacity: 0.42;
+    }
+
     .primary-button {
       min-width: 160px;
       min-height: 50px;
@@ -1778,6 +1811,154 @@
       background: transparent;
     }
 
+    /* Codex 询问保持为小型居中对话框；结果只做紧凑反馈，完整命令卡由主清单承载。 */
+    .codex-dialog-layer {
+      position: fixed;
+      inset: 0;
+      z-index: 32;
+      display: none;
+      place-items: center;
+      padding: 20px;
+      background: rgba(54, 48, 38, 0.2);
+    }
+
+    .codex-dialog-layer.is-open { display: grid; }
+
+    .codex-dialog-dismiss {
+      position: absolute;
+      inset: 0;
+      border: 0;
+      background: transparent;
+      cursor: default;
+    }
+
+    .codex-dialog {
+      position: relative;
+      width: min(540px, calc(100vw - 40px));
+      max-height: calc(100vh - 40px);
+      padding: 28px;
+      overflow-y: auto;
+      border: 1px solid var(--paper-line-strong);
+      border-radius: 6px;
+      background: var(--paper-raised);
+      box-shadow: 0 24px 72px rgba(54, 48, 38, 0.09);
+    }
+
+    .codex-dialog h2 {
+      margin: 0 0 8px;
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 24px;
+      font-weight: 600;
+    }
+
+    .codex-dialog-description {
+      margin: 0 0 18px;
+      color: var(--ink-soft);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .codex-cli-status {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 36px;
+      margin: 0 0 20px;
+      padding: 8px 11px;
+      border: 1px solid var(--paper-line);
+      border-radius: 4px;
+      background: var(--paper-surface);
+      color: var(--ink-soft);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    .codex-cli-status::before {
+      content: "";
+      flex: 0 0 auto;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--ink-quiet);
+    }
+
+    .codex-cli-status[data-state="available"]::before { background: var(--olive); }
+    .codex-cli-status[data-state="unavailable"] { color: var(--paper-danger); }
+    .codex-cli-status[data-state="unavailable"]::before { background: var(--paper-danger); }
+    .codex-cli-status[data-state="checking"]::before { animation: sync-pulse 900ms ease-in-out infinite alternate; }
+
+    .codex-question-input {
+      min-height: 112px;
+      resize: vertical;
+    }
+
+    .codex-result-preview {
+      display: grid;
+      gap: 8px;
+      margin-top: 18px;
+      padding: 14px;
+      border: 1px solid var(--paper-line);
+      border-left: 3px solid var(--olive);
+      border-radius: 4px;
+      background: var(--paper-surface);
+    }
+
+    .codex-result-preview[hidden] { display: none; }
+
+    .codex-result-label {
+      margin: 0;
+      color: var(--olive);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+    }
+
+    .codex-result-title {
+      color: var(--ink);
+      font-family: var(--font-display);
+      font-size: 17px;
+    }
+
+    .codex-result-command,
+    .codex-raw-response {
+      margin: 0;
+      padding: 10px 11px;
+      overflow-wrap: anywhere;
+      border: 1px solid var(--paper-line);
+      border-radius: 4px;
+      background: var(--paper-code);
+      color: var(--ink);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+
+    .codex-raw-response {
+      max-height: 132px;
+      overflow-y: auto;
+    }
+
+    .codex-dialog-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .codex-dialog-footer .primary-button,
+    .codex-dialog-footer .secondary-button {
+      min-width: 112px;
+      min-height: 42px;
+      margin: 0;
+    }
+
+    .codex-dialog-footer .secondary-button {
+      border-color: var(--paper-line-strong);
+      background: transparent;
+    }
+
     .text-input,
     .text-area {
       border-color: var(--paper-line-strong);
@@ -1822,7 +2003,8 @@
 
     @media (prefers-reduced-motion: reduce) {
       .command-toggle .icon { transition: none; }
-      .sync-status[data-state="syncing"] .sync-status-dot { animation: none; }
+      .sync-status[data-state="syncing"] .sync-status-dot,
+      .codex-cli-status[data-state="checking"]::before { animation: none; }
     }
   </style>
 </head>
@@ -1885,9 +2067,14 @@
           </div>
           <p class="header-description" id="category-description">容器日常查看、排障和清理时最常用的一组命令。</p>
         </div>
-        <button class="primary-button" id="add-command-button" type="button" data-od-id="add-command-button">
-          <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>添加命令
-        </button>
+        <div class="workspace-actions">
+          <button class="secondary-button codex-entry-button" id="ask-codex-button" type="button">
+            <svg class="icon" aria-hidden="true"><use href="#icon-terminal"></use></svg>问 Codex
+          </button>
+          <button class="primary-button" id="add-command-button" type="button" data-od-id="add-command-button">
+            <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>添加命令
+          </button>
+        </div>
       </header>
       <ol class="command-list" id="command-list" data-od-id="command-list"></ol>
       <section class="empty-state" id="empty-state" data-od-id="empty-category-state" hidden>
@@ -1965,6 +2152,33 @@
         <footer class="repository-dialog-footer">
           <button class="secondary-button" id="repository-cancel" type="button">取消</button>
           <button class="primary-button" type="submit">使用此仓库</button>
+        </footer>
+      </form>
+    </section>
+  </div>
+
+  <div class="codex-dialog-layer" id="codex-dialog-layer" aria-hidden="true">
+    <button class="codex-dialog-dismiss" id="codex-dialog-dismiss" type="button" tabindex="-1" aria-label="关闭 Codex 命令询问"></button>
+    <section class="codex-dialog" role="dialog" aria-modal="true" aria-labelledby="codex-dialog-title" tabindex="-1" aria-busy="false">
+      <form id="codex-form" novalidate>
+        <h2 id="codex-dialog-title">问 Codex</h2>
+        <p class="codex-dialog-description">描述你想完成的操作。Codex 只生成命令与说明，CommandShelf 绝不会执行这条命令。</p>
+        <p class="codex-cli-status" id="codex-cli-status" data-state="checking" role="status" aria-live="polite">正在检查本机 Codex CLI…</p>
+        <label class="field">
+          <span class="field-label">你想查什么命令？ <span class="required">*</span></span>
+          <textarea class="text-area codex-question-input" id="codex-question-input" name="question" maxlength="2000" placeholder="例如：查看占用 8080 端口的进程，并显示进程详情" required></textarea>
+          <span class="field-hint">建议说明系统环境、目标和必要限制；内容只通过标准输入发送给本机 Codex CLI。</span>
+        </label>
+        <p class="form-error" id="codex-error" role="alert"></p>
+        <section class="codex-result-preview" id="codex-result-preview" aria-live="polite" hidden>
+          <p class="codex-result-label" id="codex-result-label">临时结果已生成</p>
+          <strong class="codex-result-title" id="codex-result-title"></strong>
+          <code class="codex-result-command" id="codex-result-command"></code>
+          <pre class="codex-raw-response" id="codex-raw-response" hidden></pre>
+        </section>
+        <footer class="codex-dialog-footer">
+          <button class="secondary-button" id="codex-cancel" type="button">关闭</button>
+          <button class="primary-button" id="codex-submit" type="submit">生成命令</button>
         </footer>
       </form>
     </section>
@@ -2111,7 +2325,21 @@
     let drawerReturnCommandId = null;
     /** 仓库对话框关闭后恢复的触发控件，支持从仓库名或同步操作入口打开。 */
     let repositoryReturnFocusTarget = null;
+    /** Codex 对话框关闭后恢复的触发控件；异步生成完成也不会把焦点强行移出用户当前位置。 */
+    let codexReturnFocusTarget = null;
+    /** 最近一次生成响应只保存在前端内存中；只有用户后续确认保存才允许进入正式分类。 */
+    let temporaryGenerationResult = null;
     const expandedCommandIds = new Set(["linux-1"]);
+
+    /** Codex 对话框状态与仓库同步状态相互独立，生成过程不冒充数据保存或网络同步。 */
+    const codexState = {
+      checking: false,
+      available: false,
+      version: "",
+      statusMessage: "尚未检查本机 Codex CLI。",
+      generating: false,
+      error: ""
+    };
 
     /**
      * 页面侧同步状态由桌面后端快照更新；浏览器预览使用同一模型演示用户可见行为。
@@ -2139,6 +2367,7 @@
     const categoryCount = document.getElementById("category-count");
     const categoryDescription = document.getElementById("category-description");
     const addCategoryButton = document.getElementById("add-category-button");
+    const askCodexButton = document.getElementById("ask-codex-button");
     const addCommandButton = document.getElementById("add-command-button");
     const drawerLayer = document.getElementById("drawer-layer");
     const drawerTitle = document.getElementById("drawer-title");
@@ -2163,6 +2392,18 @@
     const repositoryForm = document.getElementById("repository-form");
     const repositoryPathInput = document.getElementById("repository-path-input");
     const repositoryError = document.getElementById("repository-error");
+    const codexDialogLayer = document.getElementById("codex-dialog-layer");
+    const codexDialog = codexDialogLayer.querySelector(".codex-dialog");
+    const codexForm = document.getElementById("codex-form");
+    const codexCliStatus = document.getElementById("codex-cli-status");
+    const codexQuestionInput = document.getElementById("codex-question-input");
+    const codexError = document.getElementById("codex-error");
+    const codexSubmitButton = document.getElementById("codex-submit");
+    const codexResultPreview = document.getElementById("codex-result-preview");
+    const codexResultLabel = document.getElementById("codex-result-label");
+    const codexResultTitle = document.getElementById("codex-result-title");
+    const codexResultCommand = document.getElementById("codex-result-command");
+    const codexRawResponse = document.getElementById("codex-raw-response");
     const toast = document.getElementById("toast");
     const toastMessage = toast.querySelector("span");
 
@@ -2374,6 +2615,7 @@
       pushButton.disabled = isBusy || !hasUsableRepository || !syncState.hasLocalChanges;
       repositoryButton.disabled = isBusy;
       addCategoryButton.disabled = !canMutateData;
+      askCodexButton.disabled = !canMutateData || categories.length === 0;
       addCommandButton.disabled = !canMutateData || categories.length === 0;
       [titleInput, codeInput, noteInput, parametersInput, outputExampleInput, riskInput, drawerSaveButton]
         .forEach((control) => { control.disabled = !canMutateData; });
@@ -2434,6 +2676,154 @@
       repositoryError.textContent = "";
       repositoryReturnFocusTarget = null;
       restoreFocus([returnTarget, repositoryButton, pullButton, addCategoryButton]);
+    }
+
+    /**
+     * 根据 CLI 检测、生成进度与临时响应统一刷新 Codex 对话框，避免异步分支各自改写半套界面。
+     * @returns {void}
+     */
+    function renderCodexDialog() {
+      const status = codexState.checking ? "checking" : codexState.available ? "available" : "unavailable";
+      const statusText = codexState.checking
+        ? "正在检查本机 Codex CLI…"
+        : [codexState.statusMessage, codexState.version].filter(Boolean).join(" ");
+      codexCliStatus.dataset.state = status;
+      codexCliStatus.textContent = statusText;
+      codexDialog.setAttribute("aria-busy", String(codexState.generating));
+      codexQuestionInput.disabled = codexState.generating;
+      codexSubmitButton.disabled = codexState.checking
+        || !codexState.available
+        || codexState.generating
+        || !codexQuestionInput.value.trim();
+      codexSubmitButton.textContent = codexState.generating ? "生成中…" : "生成命令";
+      codexError.textContent = codexState.error;
+
+      const result = temporaryGenerationResult;
+      codexResultPreview.hidden = !result;
+      codexResultTitle.hidden = result?.status !== "generated";
+      codexResultCommand.hidden = result?.status !== "generated";
+      codexRawResponse.hidden = result?.status !== "manualEntryRequired";
+      if (result?.status === "generated") {
+        codexResultLabel.textContent = "临时结果已生成";
+        codexResultTitle.textContent = result.draft?.title || "未命名命令";
+        codexResultCommand.textContent = result.draft?.command || "";
+        codexRawResponse.textContent = "";
+      } else if (result?.status === "manualEntryRequired") {
+        codexResultLabel.textContent = "两次响应都未通过格式校验";
+        codexResultTitle.textContent = "";
+        codexResultCommand.textContent = "";
+        codexRawResponse.textContent = result.rawResponse || "Codex 未返回可显示的内容。";
+      } else {
+        codexResultTitle.textContent = "";
+        codexResultCommand.textContent = "";
+        codexRawResponse.textContent = "";
+      }
+    }
+
+    /**
+     * 打开轻量 Codex 询问框并启动本机 CLI 检测；没有可用当前分类时不创建无归属草稿。
+     * @param {HTMLElement|null} triggerElement 打开对话框的控件，用于关闭后恢复焦点。
+     * @returns {void}
+     */
+    function openCodexDialog(triggerElement = document.activeElement) {
+      if (!syncState.repositoryAvailable || syncState.operation || !getActiveCategory()) return;
+      codexReturnFocusTarget = triggerElement instanceof HTMLElement ? triggerElement : null;
+      codexState.error = "";
+      codexDialogLayer.classList.add("is-open");
+      codexDialogLayer.setAttribute("aria-hidden", "false");
+      renderCodexDialog();
+      void refreshCodexCliStatus();
+      window.setTimeout(() => {
+        /* 检测结果不会夺取焦点；只在对话框仍打开时进入用户问题输入框。 */
+        if (codexDialogLayer.classList.contains("is-open")) codexQuestionInput.focus({ preventScroll: true });
+      }, 80);
+    }
+
+    /**
+     * 关闭 Codex 对话框并恢复入口焦点；临时结果继续留在内存中供下一层主界面展示。
+     * @returns {void}
+     */
+    function closeCodexDialog() {
+      const returnTarget = codexReturnFocusTarget;
+      codexDialogLayer.classList.remove("is-open");
+      codexDialogLayer.setAttribute("aria-hidden", "true");
+      codexState.error = "";
+      codexReturnFocusTarget = null;
+      restoreFocus([returnTarget, askCodexButton, addCommandButton, repositoryButton]);
+    }
+
+    /**
+     * 通过只读 Tauri 命令检查本机 Codex CLI；浏览器预览不会伪造 CLI 或模型响应。
+     * @returns {Promise<void>} 最新一次检测结果应用到对话框后完成。
+     */
+    async function refreshCodexCliStatus() {
+      codexState.checking = true;
+      codexState.available = false;
+      codexState.version = "";
+      codexState.statusMessage = "";
+      renderCodexDialog();
+
+      if (!isDesktopRuntime) {
+        codexState.checking = false;
+        codexState.statusMessage = "请在安装后的桌面程序中使用本机 Codex CLI。";
+        renderCodexDialog();
+        return;
+      }
+
+      try {
+        const status = await window.__TAURI__.core.invoke("get_codex_cli_status");
+        codexState.available = Boolean(status?.available);
+        codexState.version = status?.version || "";
+        codexState.statusMessage = status?.statusMessage || (codexState.available
+          ? "已检测到可用的 Codex CLI。"
+          : "无法使用 Codex CLI，请先检查安装。"
+        );
+      } catch (error) {
+        codexState.available = false;
+        codexState.statusMessage = [error?.message, error?.action].filter(Boolean).join(" ")
+          || "暂时无法检查 Codex CLI。";
+      } finally {
+        codexState.checking = false;
+        renderCodexDialog();
+      }
+    }
+
+    /**
+     * 提交一次自然语言问题并接收互斥的生成结果；响应仅留在内存，不触发保存或 Git 状态变化。
+     * @returns {Promise<void>} 生成成功、转入人工整理或显示稳定错误后完成。
+     */
+    async function requestCodexDraft() {
+      const question = codexQuestionInput.value.trim();
+      if (!question) {
+        codexState.error = "请先描述你想查询的命令。";
+        renderCodexDialog();
+        codexQuestionInput.focus();
+        return;
+      }
+      if (!isDesktopRuntime || !codexState.available || codexState.generating) return;
+
+      codexState.generating = true;
+      codexState.error = "";
+      temporaryGenerationResult = null;
+      renderCodexDialog();
+      try {
+        const result = await window.__TAURI__.core.invoke("generate_command_draft", { question });
+        if (result?.status === "generated" && result.draft) {
+          temporaryGenerationResult = result;
+          showToastFeedback("Codex 临时命令已生成");
+        } else if (result?.status === "manualEntryRequired") {
+          temporaryGenerationResult = result;
+          showToastFeedback("Codex 返回内容需要手动整理", "error", 2600);
+        } else {
+          throw new Error("Codex 返回了无法识别的生成状态。");
+        }
+      } catch (error) {
+        codexState.error = [error?.message, error?.action].filter(Boolean).join(" ")
+          || "Codex CLI 未能生成命令，请检查登录和网络后重试。";
+      } finally {
+        codexState.generating = false;
+        renderCodexDialog();
+      }
     }
 
     /**
@@ -2890,6 +3280,8 @@
       commandList.querySelectorAll(".is-dragging, .is-drag-over").forEach((node) => node.classList.remove("is-dragging", "is-drag-over"));
     });
 
+    /** Codex 入口只打开临时生成流程，不直接修改当前分类。 */
+    askCodexButton.addEventListener("click", () => openCodexDialog(askCodexButton));
     /** 新增命令入口始终作用于当前分类，并作为关闭抽屉后的明确焦点返回点。 */
     addCommandButton.addEventListener("click", () => openDrawer(null, addCommandButton));
     document.getElementById("drawer-close").addEventListener("click", closeDrawer);
@@ -2993,6 +3385,13 @@
     pushButton.addEventListener("click", () => { void runSyncOperation("push"); });
     document.getElementById("repository-cancel").addEventListener("click", closeRepositoryDialog);
     document.getElementById("repository-dialog-dismiss").addEventListener("click", closeRepositoryDialog);
+    document.getElementById("codex-cancel").addEventListener("click", closeCodexDialog);
+    document.getElementById("codex-dialog-dismiss").addEventListener("click", closeCodexDialog);
+    codexQuestionInput.addEventListener("input", renderCodexDialog);
+    codexForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void requestCodexDraft();
+    });
 
     /**
      * 把后端文档映射为既有视觉组件使用的只读视图模型。
@@ -3195,11 +3594,20 @@
     });
 
     /**
-     * 统一管理最上层浮层的 Escape 与 Tab：仓库对话框优先级高于命令抽屉，键盘事件不会落入背景页面。
+     * 统一管理最上层浮层的 Escape 与 Tab：Codex、仓库对话框依次优先于命令抽屉。
      * @param {KeyboardEvent} event 页面级键盘事件。
      * @returns {void}
      */
     document.addEventListener("keydown", (event) => {
+      if (codexDialogLayer.classList.contains("is-open")) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeCodexDialog();
+        } else {
+          trapDialogFocus(event, codexDialog);
+        }
+        return;
+      }
       if (repositoryDialogLayer.classList.contains("is-open")) {
         if (event.key === "Escape") {
           event.preventDefault();
