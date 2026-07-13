@@ -2,9 +2,9 @@
 
 ## 项目定位
 
-CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Linux、Docker、Git、SSH 等命令保存在独立 Git 仓库的 `commands.json` 中，应用负责分类浏览、编辑、排序、复制以及显式拉取和推送。
+CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Linux、Docker、Git、SSH 等命令保存在独立 Git 仓库的 `commands.json` 中，应用负责分类浏览、编辑、排序、复制、Codex 临时草稿生成以及显式拉取和推送。
 
-保持产品轻量、单机、本地优先。除非用户明确提出新需求，不要主动加入搜索、AI 生成、命令执行、后台同步、应用内 GitHub 登录、Token 管理、冲突合并或多人协作。
+保持产品轻量、单机、本地优先。现有 AI 能力仅调用本机 Codex CLI 生成不执行的临时草稿。除非用户明确提出新需求，不要主动加入搜索、命令执行、后台同步、应用内 GitHub 登录、Token 管理、冲突合并、其他 AI 提供方或多人协作。
 
 ## 首次接手顺序
 
@@ -34,6 +34,7 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 - 前端没有 Node 构建流程；Node 只用于桌面验收脚本和前端语法检查。
 - Git 同步由 Rust 后端调用系统 `git.exe`，不使用 GitHub API。
 - Git for Windows 是连接数据仓库的前置条件，缺失时只提示安装，不维护第二套无 Git 数据模式。
+- Codex 生成功能直接调用系统 PATH 中的 `codex` 命令；Codex CLI 属于可选前置条件，缺失时不影响手工管理命令。
 - 主窗口默认 1180×820，最小尺寸 980×700。
 
 ## 核心模块职责
@@ -41,10 +42,12 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 - `app_service.rs`：编排配置、文档保存、拉取和推送用例。
 - `command_store.rs`：读取、校验和序列化 `commands.json`。
 - `git_repository.rs`：验证仓库、运行受控 Git 命令并处理超时和错误分类。
+- `process_runner.rs`：统一执行带超时、输出上限和进程树终止能力的受控子进程。
+- `codex_cli.rs`：识别本机 Codex CLI，并在隔离、只读、一次性会话中生成命令草稿。
 - `config_store.rs`：在 `%APPDATA%\CommandShelf` 保存当前机器选择的数据仓库路径。
 - `backup_store.rs`：写入前备份命令数据，备份不进入数据仓库。
 - `file_io.rs`：原子写入、刷新和文件哈希。
-- `model.rs`：`schemaVersion: 1` 数据模型和前后端快照契约。
+- `model.rs`：`schemaVersion: 1` 数据模型、前后端快照和临时 Codex 草稿契约。
 - `error.rs`：稳定的结构化错误码、用户消息和下一步建议。
 - `lib.rs`：向前端注册 Tauri 命令。
 
@@ -85,6 +88,17 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 - 保存前必须核对文档基线，外部文件已经变化时拒绝覆盖。
 - 无效远端数据不能替换当前可用数据。
 
+## Codex 草稿规则
+
+- 应用只识别本机 Codex CLI，不接入 Claude Code、远端 API 密钥或应用内登录。
+- 用户问题通过标准输入发送给 `codex exec`，不进入命令行参数。
+- 每次调用使用临时会话、只读沙箱、禁止审批和隔离临时工作目录；应用还会拒绝包含工具调用事件的响应。
+- 固定提示词要求只生成命令说明 JSON，并明确禁止执行、试运行或验证所推荐的命令。
+- 只有 JSON 解析或字段校验失败时才新建会话重试一次；进程、超时、非零退出或工具调用失败不重试。
+- 第二次响应仍无效时显示第二次原文，由用户在对话框中人工补齐结构化字段。
+- 合法结果只作为当前分类顶部的内存临时卡片，不分配命令 ID、不写入 `commands.json`、不改变 Git 状态。
+- 只有用户点击“保存到当前分类”后才生成正式 ID、插入分类首位并经过既有原子保存与失败回滚流程。
+
 ## Git 同步规则
 
 - 数据仓库必须是 Git 根目录，并具有 `origin`、当前分支和可用上游。
@@ -117,7 +131,7 @@ node --check scripts\desktop-smoke.mjs
 正式发布使用：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\release-candidate.ps1
+pwsh -ExecutionPolicy Bypass -File scripts\release-candidate.ps1
 ```
 
 发布脚本会在 `.local` 下生成大量 Rust/Tauri 缓存。任务结束后如果用户要求清理，先保留需要交付的安装包，再删除 `.local` 中的缓存和验收夹具。
@@ -127,6 +141,7 @@ powershell -ExecutionPolicy Bypass -File scripts\release-candidate.ps1
 - 数据模型变化：覆盖合法数据、缺失字段、重复 ID、未知版本和大小上限。
 - 保存变化：覆盖原子写入、备份、外部基线变化和重启恢复。
 - Git 变化：覆盖正常拉取/推送、远端领先、本地未提交、身份/认证/网络失败和进程超时。
+- Codex 变化：覆盖 CLI 存在/缺失、合法 JSON、单次格式重试、二次失败原文、工具调用拒绝、超时和临时结果不落盘。
 - UI 变化：至少检查 1440×1024、1024×768、最小窗口、无横向溢出和长内容纵向滚动。
 - 键盘变化：检查模态焦点圈、Escape 返回原入口、保存后焦点恢复及 `Alt+↑`、`Alt+↓` 排序。
 - 安装变化：检查安装、开始菜单启动、卸载和数据仓库保留。
@@ -137,9 +152,10 @@ powershell -ExecutionPolicy Bypass -File scripts\release-candidate.ps1
 ## 当前状态与已知问题
 
 - 当前版本：`0.1.0`。
-- 已通过 Rust 测试、Clippy、格式、双尺寸界面、键盘、安装启动和卸载数据保留验证。
-- 当前安装包 SHA-256：`C3CF971098263136EA4559B6D9D1A88727A420868CB219DCBA27ED20069411D8`。
-- 已知发布问题：安装包内主程序与最后一次免安装构建的 SHA-256 不一致。下次发布前统一重建 EXE 和 NSIS 安装包，并增加安装后主程序哈希一致性门禁。
+- 已通过 Rust 46 项测试、Clippy 零警告、格式、前端语法和 Windows x64 NSIS 发布构建。
+- Codex CLI 识别、受控生成、格式重试、人工整理、临时展示和显式保存均已实现；界面操作由用户在新安装包上验收。
+- 当前安装包 SHA-256：`072E4204A3FAF518C7725CE610AA0DE963FF28B23F35D27C9302970FBDDAFC5D`。
+- 当前安装包与独立 EXE 来自同一次发布候选构建；安装、界面尺寸、键盘操作和卸载数据保留仍需用户对本次新包手工复验。
 
 ## 协作与 Git
 
