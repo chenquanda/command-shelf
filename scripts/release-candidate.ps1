@@ -1,3 +1,5 @@
+#requires -Version 7.0
+
 <#
 .SYNOPSIS
 构建并校验 CommandShelf Windows x64 发布候选。
@@ -251,18 +253,65 @@ function Assert-ArtifactSize {
     return [Math]::Round($sizeMiB, 3)
 }
 
+<#
+.SYNOPSIS
+确认发布候选来自没有未提交、暂存或未跟踪文件的确定 Git 工作树。
+
+.PARAMETER RepositoryRoot
+需要检查的 CommandShelf 仓库根目录。
+
+.OUTPUTS
+无返回值；发现任何未记录源码时立即终止，避免把产物错误归因给 HEAD。
+#>
+function Assert-CleanGitWorktree {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot
+    )
+
+    & git -C $RepositoryRoot diff --quiet --exit-code
+    if ($LASTEXITCODE -ne 0) {
+        throw "发布工作树包含未提交修改，请先保存到本地 Git。"
+    }
+
+    & git -C $RepositoryRoot diff --cached --quiet --exit-code
+    if ($LASTEXITCODE -ne 0) {
+        throw "发布工作树包含已暂存但未提交的修改，请先完成本地提交。"
+    }
+
+    $untrackedFiles = @(& git -C $RepositoryRoot ls-files --others --exclude-standard)
+    if ($LASTEXITCODE -ne 0) {
+        throw "无法检查发布工作树中的未跟踪文件。"
+    }
+    if ($untrackedFiles.Count -gt 0) {
+        throw "发布工作树包含未跟踪文件：$($untrackedFiles -join '；')。"
+    }
+}
+
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $resolvedTargetDirectory = Resolve-OutputDirectory -Path $TargetDirectory -RepositoryRoot $repositoryRoot
 $resolvedEvidenceDirectory = Resolve-OutputDirectory -Path $EvidenceDirectory -RepositoryRoot $repositoryRoot
 $manifestPath = Join-Path $repositoryRoot "src-tauri\Cargo.toml"
+$tauriConfigPath = Join-Path $repositoryRoot "src-tauri\tauri.conf.json"
 $frontendPath = Join-Path $repositoryRoot "frontend\index.html"
 $desktopSmokePath = Join-Path $repositoryRoot "scripts\desktop-smoke.mjs"
 $targetTriple = "x86_64-pc-windows-msvc"
 $previousCargoTargetDirectory = $env:CARGO_TARGET_DIR
+$locationPushed = $false
 
 try {
+    # 固定工作目录可阻止 Tauri CLI 在多 worktree 上级目录误选兄弟项目；finally 负责恢复调用方位置。
+    Push-Location -LiteralPath $repositoryRoot
+    $locationPushed = $true
+
     # 所有 Cargo 步骤共享调用方指定目录，避免测试和正式构建重复编译同一依赖。
     $env:CARGO_TARGET_DIR = $resolvedTargetDirectory
+    Assert-CleanGitWorktree -RepositoryRoot $repositoryRoot
+    $gitCommitBefore = (& git -C $repositoryRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "无法读取构建前 Git 提交。"
+    }
 
     Invoke-CheckedCommand -Label "Rust 格式检查" -FilePath "cargo" -Arguments @("fmt", "--manifest-path", $manifestPath, "--check")
     Invoke-CheckedCommand -Label "Rust 全目标测试" -FilePath "cargo" -Arguments @("test", "--manifest-path", $manifestPath, "--all-targets")
@@ -295,8 +344,10 @@ scripts.forEach((match, index) => {
         Get-ChildItem -LiteralPath $releaseDirectory -File -Filter "command-shelf.exe" -ErrorAction SilentlyContinue
     )
     $installerDirectory = Join-Path $releaseDirectory "bundle\nsis"
+    $tauriConfig = Get-Content -Raw -LiteralPath $tauriConfigPath | ConvertFrom-Json
+    $installerFileName = "$($tauriConfig.productName)_$($tauriConfig.version)_x64-setup.exe"
     $installerCandidates = @(
-        Get-ChildItem -LiteralPath $installerDirectory -File -Filter "*-setup.exe" -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $installerDirectory -File -Filter $installerFileName -ErrorAction SilentlyContinue
     )
     $application = Get-UniqueArtifact -Candidates $applicationCandidates -Description "CommandShelf 应用 EXE"
     $installer = Get-UniqueArtifact -Candidates $installerCandidates -Description "CommandShelf NSIS 安装包"
@@ -309,6 +360,10 @@ scripts.forEach((match, index) => {
     if ($LASTEXITCODE -ne 0) {
         throw "无法读取当前 Git 提交，发布证据未生成。"
     }
+    if ($gitCommit -ne $gitCommitBefore) {
+        throw "构建期间 Git HEAD 已变化，拒绝生成归属不明的发布证据。"
+    }
+    Assert-CleanGitWorktree -RepositoryRoot $repositoryRoot
 
     # 证据只记录本次成功构建的确定产物；路径保留绝对值，便于本机安装验收直接使用。
     $evidence = [ordered]@{
@@ -316,6 +371,7 @@ scripts.forEach((match, index) => {
         generatedAtUtc = [DateTime]::UtcNow.ToString("o")
         repositoryRoot = $repositoryRoot
         gitCommit = $gitCommit
+        workingTreeClean = $true
         targetTriple = $targetTriple
         gates = @(
             "cargo fmt --check",
@@ -323,7 +379,8 @@ scripts.forEach((match, index) => {
             "cargo clippy --all-targets -- -D warnings",
             "desktop-smoke.mjs 语法",
             "frontend/index.html 内联脚本语法",
-            "cargo tauri build --bundles nsis"
+            "cargo tauri build --bundles nsis",
+            "Git 工作树干净且构建前后 HEAD 一致"
         )
         tools = [ordered]@{
             rustc = Get-CommandVersion -FilePath "rustc" -Arguments @("--version")
@@ -356,7 +413,10 @@ scripts.forEach((match, index) => {
     $evidence
 }
 finally {
-    # 环境变量属于调用方进程状态，必须在成功和异常两条路径都恢复。
+    # 工作目录和环境变量都属于调用方进程状态，必须在成功和异常两条路径恢复。
+    if ($locationPushed) {
+        Pop-Location
+    }
     if ($null -eq $previousCargoTargetDirectory) {
         Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
     }
