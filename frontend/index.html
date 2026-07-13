@@ -2827,6 +2827,7 @@
       commandList.dataset.readonly = String(!canMutateData);
       commandList.querySelectorAll("[data-edit-id]").forEach((button) => { button.disabled = !canMutateData; });
       commandList.querySelectorAll("[data-sort-id]").forEach((button) => { button.disabled = !canMutateData; });
+      commandList.querySelectorAll("[data-copy-id]").forEach((button) => { button.disabled = !canMutateData; });
       commandList.querySelectorAll("[data-command-id]").forEach((item) => { item.draggable = canMutateData; });
     }
 
@@ -3498,16 +3499,14 @@
      * @returns {Promise<void>} 复制与计数保存或明确降级提示完成后结束。
      */
     async function copyCommandAndRecord(command, originalButton) {
+      if (syncState.operation) {
+        showToastFeedback("当前正在保存或同步，请完成后再复制命令", "error", 2200);
+        return;
+      }
       try {
         await copyText(command.code);
       } catch (error) {
         showToastFeedback("复制失败，请手动选择命令", "error");
-        return;
-      }
-
-      /* 同步或其他保存进行中时仍保证核心复制可用，但不与正在持锁的文档操作争抢计数写入。 */
-      if (syncState.operation) {
-        showCopiedFeedback(originalButton, "命令已复制；当前操作进行中，本次未计数");
         return;
       }
 

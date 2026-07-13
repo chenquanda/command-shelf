@@ -44,7 +44,7 @@ fn try_lock_operations(operation_lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>,
         Err(TryLockError::WouldBlock) => Err(AppError::new(
             "OPERATION_IN_PROGRESS",
             "另一项保存或同步操作仍在进行，本次请求未排队。",
-            "等待当前操作结束后再重试；浏览与复制仍可继续使用。",
+            "等待当前操作结束后再重试；浏览和复制参考输出仍可继续使用。",
             true,
         )),
     }
