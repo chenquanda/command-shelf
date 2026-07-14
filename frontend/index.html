@@ -2359,6 +2359,7 @@
     <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
     <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="icon-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></symbol>
+    <symbol id="icon-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 10v6M14 10v6"/></symbol>
     <symbol id="icon-grip" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1" fill="currentColor" stroke="none"/></symbol>
     <symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
     <symbol id="icon-x" viewBox="0 0 24 24"><path d="m18 6-12 12M6 6l12 12"/></symbol>
@@ -3830,6 +3831,9 @@
                     <button class="action-button icon-only" type="button" data-inbox-edit="${escapeHtml(item.id)}" aria-label="编辑这条临时记录" title="编辑">
                       <svg class="icon" aria-hidden="true"><use href="#icon-edit"></use></svg>
                     </button>
+                    <button class="action-button icon-only" type="button" data-inbox-delete="${escapeHtml(item.id)}" aria-label="删除这条临时记录" title="删除">
+                      <svg class="icon" aria-hidden="true"><use href="#icon-trash"></use></svg>
+                    </button>
                   </div>
                 `}
               </li>
@@ -4308,7 +4312,7 @@
       ]);
     }
 
-    /** 时间流按钮委托：ATOM-06 只开放编辑与取消，不提前处理删除。 */
+    /** 时间流按钮委托：编辑保持行内完成，删除必须先经过用户确认。 */
     inboxGroups.addEventListener("click", (event) => {
       const editButton = event.target.closest("[data-inbox-edit]");
       if (editButton) {
@@ -4320,6 +4324,28 @@
           const input = inboxGroups.querySelector(`[data-inbox-edit-input="${CSS.escape(itemId)}"]`);
           input?.focus({ preventScroll: true });
           input?.setSelectionRange(input.value.length, input.value.length);
+        });
+        return;
+      }
+
+      const deleteButton = event.target.closest("[data-inbox-delete]");
+      if (deleteButton) {
+        if (syncState.operation) return;
+        const itemId = deleteButton.dataset.inboxDelete;
+        if (!window.confirm("确定删除这条临时记录吗？")) return;
+        const previousItems = structuredClone(inboxState.items);
+        const itemIndex = inboxState.items.findIndex((item) => item.id === itemId);
+        if (itemIndex < 0) return;
+        inboxState.items.splice(itemIndex, 1);
+        const nextItemId = inboxState.items[Math.min(itemIndex, inboxState.items.length - 1)]?.id || null;
+        render();
+        void persistInboxMutation(previousItems, "临时记录已删除").then((saved) => {
+          const focusItemId = saved ? nextItemId : itemId;
+          restoreFocus([
+            focusItemId ? inboxGroups.querySelector(`[data-inbox-delete="${CSS.escape(focusItemId)}"]`) : null,
+            newInboxButton,
+            inboxContentInput
+          ]);
         });
         return;
       }

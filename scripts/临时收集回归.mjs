@@ -347,6 +347,76 @@ try {
     focusRestored: document.activeElement.matches('[data-inbox-edit]')
   })`);
 
+  /* 把最后一条测试记录调整到昨天，验证删除分组最后一条时日期标题会随之消失。 */
+  const yesterdayItemId = await evaluate(cdp.send, `(() => {
+    const state = JSON.parse(localStorage.getItem('command-shelf-inbox-regression'));
+    const item = state.items.at(-1);
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    item.createdAt = yesterday.toISOString();
+    item.updatedAt = item.createdAt;
+    localStorage.setItem('command-shelf-inbox-regression', JSON.stringify(state));
+    return item.id;
+  })()`);
+  await cdp.send("Page.reload", { ignoreCache: true });
+  await waitForCondition(cdp.send, "document.readyState === 'complete' && document.querySelector('#repository-button')?.textContent.includes('mock-command-data')", "重载删除测试数据");
+  await evaluate(cdp.send, "document.querySelector('#inbox-nav-button').click()");
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-nav-count')?.textContent === '4' && [...document.querySelectorAll('.inbox-group-title')].some((title) => title.textContent === '昨天')", "形成昨天日期分组");
+
+  const cancelDeleteEvidence = await evaluate(cdp.send, `(() => {
+    window.confirm = () => false;
+    const button = document.querySelector('[data-inbox-delete]');
+    button.focus();
+    button.click();
+    return {
+      count: document.querySelector('#inbox-nav-count').textContent,
+      storedCount: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items.length,
+      focusStayed: document.activeElement === button
+    };
+  })()`);
+
+  const failedDeleteId = await evaluate(cdp.send, `(() => {
+    window.confirm = () => true;
+    window.__inboxMock.failNextSave = true;
+    const button = document.querySelector('[data-inbox-delete]');
+    const itemId = button.dataset.inboxDelete;
+    button.click();
+    return itemId;
+  })()`);
+  await waitForCondition(cdp.send, `document.querySelector('#inbox-nav-count')?.textContent === '4' && !document.querySelector('#inbox-save-button').disabled && document.activeElement?.dataset.inboxDelete === '${failedDeleteId}'`, "删除保存失败完成顺序与焦点回滚");
+  const deleteFailureEvidence = await evaluate(cdp.send, `({
+    count: document.querySelector('#inbox-nav-count').textContent,
+    storedCount: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items.length,
+    restoredId: document.activeElement?.dataset.inboxDelete,
+    visibleIds: [...document.querySelectorAll('[data-inbox-id]')].map((item) => item.dataset.inboxId)
+  })`);
+
+  await evaluate(cdp.send, `document.querySelector('[data-inbox-delete="${yesterdayItemId}"]').click()`);
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-nav-count')?.textContent === '3' && !document.querySelector('#inbox-save-button').disabled", "删除昨天分组最后一条");
+  const groupDeleteEvidence = await evaluate(cdp.send, `({
+    storedCount: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items.length,
+    groupLabels: [...document.querySelectorAll('.inbox-group-title')].map((title) => title.textContent)
+  })`);
+
+  for (const expectedCount of [2, 1, 0]) {
+    await evaluate(cdp.send, "document.querySelector('[data-inbox-delete]').click()");
+    await waitForCondition(cdp.send, `document.querySelector('#inbox-nav-count')?.textContent === '${expectedCount}' && !document.querySelector('#inbox-save-button').disabled`, `连续删除后剩余 ${expectedCount} 条`);
+  }
+  const emptyDeleteEvidence = await evaluate(cdp.send, `({
+    count: document.querySelector('#inbox-nav-count').textContent,
+    storedCount: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items.length,
+    emptyText: document.querySelector('#inbox-state').textContent,
+    emptyVisible: getComputedStyle(document.querySelector('#inbox-state')).display !== 'none'
+  })`);
+  await cdp.send("Page.reload", { ignoreCache: true });
+  await waitForCondition(cdp.send, "document.readyState === 'complete' && document.querySelector('#repository-button')?.textContent.includes('mock-command-data')", "重启检查删除持久化");
+  await evaluate(cdp.send, "document.querySelector('#inbox-nav-button').click()");
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-nav-count')?.textContent === '0'", "重启后保持空临时收集");
+  const deleteRestartEvidence = await evaluate(cdp.send, `({
+    count: document.querySelector('#inbox-nav-count').textContent,
+    storedCount: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items.length
+  })`);
+
   const failures = [];
   if (!readOnlyEvidence.fixedEntryBeforeCategories) failures.push("临时收集入口不在分类目录之前");
   if (readOnlyEvidence.activeEntry !== "page") failures.push("临时收集入口没有选中语义");
@@ -366,6 +436,11 @@ try {
   if (!emptyEditEvidence.editorOpen || !emptyEditEvidence.error.includes("不能为空")) failures.push("空白编辑没有被拒绝");
   if (editEvidence.stored.id !== beforeEdit.id || editEvidence.stored.createdAt !== beforeEdit.createdAt || editEvidence.stored.updatedAt === beforeEdit.updatedAt || editEvidence.visibleContent !== "已完成一次有效编辑" || !editEvidence.focusRestored) failures.push("有效编辑没有保持标识与创建时间或更新修改时间");
   if (editFailureEvidence.visibleContent !== "已完成一次有效编辑" || editFailureEvidence.storedContent !== "已完成一次有效编辑" || !editFailureEvidence.focusRestored) failures.push("编辑保存失败没有回滚内容与焦点");
+  if (cancelDeleteEvidence.count !== "4" || cancelDeleteEvidence.storedCount !== 4 || !cancelDeleteEvidence.focusStayed) failures.push("取消删除改变了数据或焦点");
+  if (deleteFailureEvidence.count !== "4" || deleteFailureEvidence.storedCount !== 4 || deleteFailureEvidence.restoredId !== failedDeleteId || deleteFailureEvidence.visibleIds.length !== 4) failures.push("删除保存失败没有恢复记录、顺序和焦点");
+  if (groupDeleteEvidence.storedCount !== 3 || groupDeleteEvidence.groupLabels.includes("昨天")) failures.push("删除分组最后一条后日期分组没有更新");
+  if (emptyDeleteEvidence.count !== "0" || emptyDeleteEvidence.storedCount !== 0 || !emptyDeleteEvidence.emptyVisible || !emptyDeleteEvidence.emptyText.includes("还没有临时记录")) failures.push("删除全部后空状态不正确");
+  if (deleteRestartEvidence.count !== "0" || deleteRestartEvidence.storedCount !== 0) failures.push("删除结果没有在重启后保持");
   if (cdp.getExceptions().length > 0) failures.push("页面运行期间出现 JavaScript 异常");
   if (failures.length > 0) throw new Error(failures.join("；"));
 
@@ -382,6 +457,11 @@ try {
     emptyEditEvidence,
     editEvidence,
     editFailureEvidence,
+    cancelDeleteEvidence,
+    deleteFailureEvidence,
+    groupDeleteEvidence,
+    emptyDeleteEvidence,
+    deleteRestartEvidence,
     viewports: [compactViewport, largeViewport],
     screenshotPath,
     runtimeExceptions: cdp.getExceptions().length,
