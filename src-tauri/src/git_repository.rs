@@ -1,9 +1,10 @@
-//! 文件职责：验证专用数据仓库、读取同步状态并执行安全快进拉取。
+//! 文件职责：验证专用数据仓库、读取受管数据状态并执行安全快进拉取与普通推送。
 //! 主要内容：固定调用受控 Git 子命令，提供非交互、无窗口、限时和有限输出的进程边界。
 //! 重要约束：程序名与参数由后端决定；禁止 Shell 字符串、merge commit、rebase、reset 和 force。
 
 use crate::command_store::parse_document_bytes;
 use crate::error::AppError;
+use crate::inbox_store::parse_inbox_document_bytes;
 use crate::process_runner::{run_process, ProcessFailure, ProcessOutput};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ pub struct PullOutcome {
 /// 一次推送是否创建了提交并实际访问远端。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PushOutcome {
-    /// 本次操作是否为未提交的 `commands.json` 创建了新提交。
+    /// 本次操作是否为未提交的受管数据文件创建了新提交。
     pub committed: bool,
     /// 本次操作是否执行并成功完成了普通 `git push`。
     pub pushed: bool,
@@ -352,7 +353,7 @@ fn local_ahead_count(repository: &Path) -> Result<u64, AppError> {
     })
 }
 
-/// 判断数据文件未提交或当前分支存在尚未推送的提交。
+/// 判断任一受管数据文件未提交，或当前分支存在尚未推送的提交。
 pub fn repository_has_local_changes(repository: &Path) -> Result<bool, AppError> {
     let status_output = require_success(
         run_git(
@@ -363,9 +364,10 @@ pub fn repository_has_local_changes(repository: &Path) -> Result<bool, AppError>
                 "--untracked-files=all",
                 "--",
                 "commands.json",
+                "inbox.json",
             ],
         )?,
-        "检查 commands.json 状态",
+        "检查受管数据文件状态",
     )?;
     if !stdout_text(&status_output).is_empty() {
         return Ok(true);
@@ -433,8 +435,8 @@ fn resolve_upstream_commit_oid(repository: &Path) -> Result<String, AppError> {
     Ok(oid)
 }
 
-/// 从固定提交 OID 读取并校验候选 `commands.json`，不改变当前工作区。
-fn validate_commit_document(repository: &Path, commit_oid: &str) -> Result<(), AppError> {
+/// 从固定提交 OID 读取并校验必需的候选 `commands.json`，不改变当前工作区。
+fn validate_commit_command_document(repository: &Path, commit_oid: &str) -> Result<(), AppError> {
     let object_spec = format!("{commit_oid}:commands.json");
     let candidate = run_git(repository, &["show", object_spec.as_str()])?;
     if !candidate.status.success() {
@@ -465,6 +467,50 @@ fn validate_commit_document(repository: &Path, commit_oid: &str) -> Result<(), A
         })
 }
 
+/// 从固定提交 OID 校验可选的 `inbox.json`；旧仓库缺失该文件时允许后续兼容初始化。
+fn validate_commit_inbox_document(repository: &Path, commit_oid: &str) -> Result<(), AppError> {
+    let listing = require_success(
+        run_git(
+            repository,
+            &["ls-tree", "--name-only", commit_oid, "--", "inbox.json"],
+        )?,
+        "检查远端临时收集文件",
+    )?;
+    if stdout_text(&listing).is_empty() {
+        return Ok(());
+    }
+
+    let object_spec = format!("{commit_oid}:inbox.json");
+    let candidate = require_success(
+        run_git(repository, &["show", object_spec.as_str()])?,
+        "读取远端临时收集文件",
+    )?;
+    if candidate.stdout_truncated {
+        return Err(AppError::new(
+            "REMOTE_INBOX_INVALID",
+            "远端 inbox.json 超过允许的读取上限。",
+            "精简远端临时收集内容后重试；本地文件未改变。",
+            false,
+        ));
+    }
+    parse_inbox_document_bytes(&candidate.stdout)
+        .map(|_| ())
+        .map_err(|error| {
+            AppError::new(
+                "REMOTE_INBOX_INVALID",
+                format!("远端 inbox.json 未通过校验：{}", error.message),
+                "在另一台电脑修复并推送有效临时收集数据后重试；本地文件未改变。",
+                false,
+            )
+        })
+}
+
+/// 校验固定远端提交中的全部受管数据；命令必需，临时收集文件兼容旧仓库缺失。
+fn validate_commit_documents(repository: &Path, commit_oid: &str) -> Result<(), AppError> {
+    validate_commit_command_document(repository, commit_oid)?;
+    validate_commit_inbox_document(repository, commit_oid)
+}
+
 /// 执行显式安全拉取：先检查本地，再 fetch，校验远端候选，最后只允许快进。
 pub fn pull_repository(repository: &Path) -> Result<PullOutcome, AppError> {
     pull_repository_with_after_validation(repository, || Ok(()))
@@ -490,7 +536,7 @@ where
     match (local_is_ancestor, upstream_is_ancestor) {
         (true, true) => Ok(PullOutcome { updated: false }),
         (true, false) => {
-            validate_commit_document(repository, &upstream_oid)?;
+            validate_commit_documents(repository, &upstream_oid)?;
             after_validation()?;
             require_success(
                 run_git(repository, &["merge", "--ff-only", &upstream_oid])?,
@@ -528,7 +574,7 @@ fn ensure_empty_index(repository: &Path) -> Result<(), AppError> {
     }
 }
 
-/// 拒绝 `commands.json` 之外的工作区变化，确保专用仓库边界可预测。
+/// 拒绝两个受管数据文件之外的工作区变化，确保专用仓库边界可预测。
 fn ensure_no_unrelated_changes(repository: &Path) -> Result<(), AppError> {
     let output = require_success(
         run_git(
@@ -540,6 +586,7 @@ fn ensure_no_unrelated_changes(repository: &Path) -> Result<(), AppError> {
                 "--",
                 ".",
                 ":(exclude)commands.json",
+                ":(exclude)inbox.json",
             ],
         )?,
         "检查仓库其他文件",
@@ -547,19 +594,46 @@ fn ensure_no_unrelated_changes(repository: &Path) -> Result<(), AppError> {
     if !stdout_text(&output).is_empty() {
         return Err(AppError::new(
             "WORKTREE_DIRTY",
-            "仓库中存在 commands.json 之外的未提交变化。",
-            "在系统终端处理其他文件后重试；应用只会提交 commands.json。",
+            "仓库中存在受管数据文件之外的未提交变化。",
+            "在系统终端处理其他文件后重试；应用只会提交 commands.json 与 inbox.json。",
             false,
         ));
     }
     Ok(())
 }
 
-/// 判断 `commands.json` 暂存后是否确有差异；退出码 1 表示存在差异。
-fn staged_document_changed(repository: &Path) -> Result<bool, AppError> {
+/// 返回当前需要暂存的受管路径；`inbox.json` 尚未创建时保持旧仓库兼容。
+///
+/// 删除已跟踪的 `inbox.json` 仍必须纳入列表，确保 Git 可以记录删除而不是遗漏变化。
+fn managed_data_files(repository: &Path) -> Result<Vec<&'static str>, AppError> {
+    let mut files = vec!["commands.json"];
+    if repository.join("inbox.json").exists() {
+        files.push("inbox.json");
+        return Ok(files);
+    }
+
+    let tracked = require_success(
+        run_git(repository, &["ls-files", "--", "inbox.json"])?,
+        "检查临时收集文件跟踪状态",
+    )?;
+    if !stdout_text(&tracked).is_empty() {
+        files.push("inbox.json");
+    }
+    Ok(files)
+}
+
+/// 判断受管数据文件暂存后是否确有差异；退出码 1 表示存在差异。
+fn staged_documents_changed(repository: &Path) -> Result<bool, AppError> {
     let output = run_git(
         repository,
-        &["diff", "--cached", "--quiet", "--", "commands.json"],
+        &[
+            "diff",
+            "--cached",
+            "--quiet",
+            "--",
+            "commands.json",
+            "inbox.json",
+        ],
     )?;
     match output.status.code() {
         Some(0) => Ok(false),
@@ -568,12 +642,15 @@ fn staged_document_changed(repository: &Path) -> Result<bool, AppError> {
     }
 }
 
-/// 撤销本次自动流程对 `commands.json` 的暂存，不改变工作区文件内容。
+/// 撤销本次自动流程对受管数据文件的暂存，不改变工作区文件内容。
 ///
 /// 该清理只在自动提交失败时执行，使用户修复 Git 身份或钩子后可以直接重试。
-fn unstage_document(repository: &Path) -> Result<(), AppError> {
+fn unstage_documents(repository: &Path) -> Result<(), AppError> {
     require_success(
-        run_git(repository, &["reset", "--quiet", "--", "commands.json"])?,
+        run_git(
+            repository,
+            &["reset", "--quiet", "--", "commands.json", "inbox.json"],
+        )?,
         "撤销应用暂存",
     )?;
     Ok(())
@@ -581,7 +658,7 @@ fn unstage_document(repository: &Path) -> Result<(), AppError> {
 
 /// 在保留原始提交错误的同时清理应用创建的暂存；清理失败时给出显式人工恢复提示。
 fn rollback_staging_after_commit_failure(repository: &Path, original: AppError) -> AppError {
-    match unstage_document(repository) {
+    match unstage_documents(repository) {
         Ok(()) => original,
         Err(cleanup) => AppError::new(
             "GIT_FAILED",
@@ -589,7 +666,7 @@ fn rollback_staging_after_commit_failure(repository: &Path, original: AppError) 
                 "{}；同时无法撤销应用创建的暂存：{}",
                 original.message, cleanup.message
             ),
-            "本地文件仍然保留；请在系统终端取消暂存 commands.json 后重试。",
+            "本地文件仍然保留；请在系统终端取消暂存 commands.json 与 inbox.json 后重试。",
             true,
         ),
     }
@@ -639,21 +716,17 @@ pub fn push_repository(repository: &Path) -> Result<PushOutcome, AppError> {
     }
     // 所有 Git 状态查询都必须在本次可能创建提交之前完成，避免提交后查询失败被误报为无副作用失败。
     let ahead_before_commit = local_ahead_count(repository)?;
+    let managed_files = managed_data_files(repository)?;
 
-    require_success(
-        run_git(repository, &["add", "--", "commands.json"])?,
-        "暂存命令数据",
-    )?;
-    let committed = if staged_document_changed(repository)? {
+    let mut add_arguments = vec!["add", "--"];
+    add_arguments.extend(managed_files.iter().copied());
+    require_success(run_git(repository, &add_arguments)?, "暂存受管数据")?;
+    let committed = if staged_documents_changed(repository)? {
         let commit_result = (|| -> Result<(), AppError> {
             let message = sync_commit_message()?;
-            require_success(
-                run_git(
-                    repository,
-                    &["commit", "-m", message.as_str(), "--", "commands.json"],
-                )?,
-                "提交命令数据",
-            )?;
+            let mut commit_arguments = vec!["commit", "-m", message.as_str(), "--"];
+            commit_arguments.extend(managed_files.iter().copied());
+            require_success(run_git(repository, &commit_arguments)?, "提交受管数据")?;
             Ok(())
         })();
         if let Err(error) = commit_result {
@@ -671,7 +744,7 @@ pub fn push_repository(repository: &Path) -> Result<PushOutcome, AppError> {
         });
     }
 
-    require_success(run_git(repository, &["push"])?, "推送命令数据")?;
+    require_success(run_git(repository, &["push"])?, "推送受管数据")?;
     // `git push` 的零退出码就是远端接受提交的提交点；其后不再运行可能失败的状态确认。
     Ok(PushOutcome {
         committed,

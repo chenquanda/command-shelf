@@ -184,7 +184,7 @@ impl AppService {
         ))
     }
 
-    /// 从当前分支上游安全拉取，并使用同一固定提交已校验的文档构造快照。
+    /// 从当前分支上游安全拉取，并校验同一固定提交中的全部受管数据文件。
     ///
     /// 副作用：会刷新 `origin` 远端引用；快进后不再运行可能把成功误报成失败的磁盘或状态查询。
     pub fn pull_repository(&self) -> Result<AppSnapshot, AppError> {
@@ -198,6 +198,7 @@ impl AppService {
         })?;
         let repository = validate_repository(Path::new(&config.repository_path))?;
         let document_path = repository.root.join("commands.json");
+        let inbox_path = repository.root.join("inbox.json");
         let baseline_document = load_document(&document_path)?;
         let outcome = git_pull_repository(&repository.root)?;
         // Blob 只负责合并前校验；快进后必须重新读取工作树，以包含 EOL 转换后的真实字节哈希。
@@ -206,6 +207,10 @@ impl AppService {
         } else {
             baseline_document
         };
+        // 旧仓库允许暂时缺少 inbox.json；一旦文件存在，就必须与远端候选一样通过完整校验。
+        if inbox_path.exists() {
+            load_inbox_document(&inbox_path)?;
+        }
         let mut snapshot = success_snapshot(repository, document, document_hash, false, false);
         snapshot.status_message = if outcome.updated {
             "已拉取并加载远端最新命令。"
@@ -216,7 +221,7 @@ impl AppService {
         Ok(snapshot)
     }
 
-    /// 保存范围校验通过后，只提交 `commands.json` 并执行普通推送。
+    /// 保存范围校验通过后，只提交两个受管数据文件并执行普通推送。
     ///
     /// 副作用：可能创建一个本地 Git 提交并访问 `origin`；成功推送后不再执行状态确认查询。
     pub fn push_repository(&self) -> Result<AppSnapshot, AppError> {
@@ -230,7 +235,12 @@ impl AppService {
         })?;
         let repository = validate_repository(Path::new(&config.repository_path))?;
         let document_path = repository.root.join("commands.json");
+        let inbox_path = repository.root.join("inbox.json");
         let (document, document_hash) = load_document(&document_path)?;
+        // 未使用临时收集页的旧仓库可以没有 inbox.json；存在时必须先阻止无效本地数据进入提交。
+        if inbox_path.exists() {
+            load_inbox_document(&inbox_path)?;
+        }
         let outcome = git_push_repository(&repository.root)?;
         let mut snapshot = success_snapshot(repository, document, document_hash, false, false);
         snapshot.status_message = match (outcome.committed, outcome.pushed) {
@@ -354,7 +364,7 @@ mod tests {
     use crate::command_store::{load_document, serialize_document};
     use crate::config_store::{save_config, AppConfig};
     use crate::git_repository::repository_has_local_changes;
-    use crate::inbox_store::serialize_inbox_document;
+    use crate::inbox_store::{load_inbox_document, serialize_inbox_document};
     use crate::model::SyncState;
     use crate::model::{CommandCategory, CommandDocument, CommandEntry};
     use crate::model::{InboxDocument, InboxEntry};
@@ -469,6 +479,18 @@ mod tests {
         git(repository, &["push"]);
     }
 
+    /// 在另一克隆中只提交临时收集文件，供拉取候选校验场景使用。
+    fn commit_and_push_inbox(repository: &Path, message: &str) {
+        git(repository, &["config", "user.name", "CommandShelf Test"]);
+        git(
+            repository,
+            &["config", "user.email", "commandshelf-test@example.invalid"],
+        );
+        git(repository, &["add", "inbox.json"]);
+        git(repository, &["commit", "-m", message]);
+        git(repository, &["push"]);
+    }
+
     /// 在裸远端安装确定性拒绝 hook；Unix 需要显式补充可执行权限。
     fn install_rejecting_pre_receive_hook(remote: &Path) {
         let hook = remote.join("hooks").join("pre-receive");
@@ -537,6 +559,30 @@ mod tests {
         assert!(!reloaded.initialized_empty_document);
         assert_eq!(reloaded.document, initialized.document);
         assert_eq!(reloaded.document_hash, initialized.document_hash);
+    }
+
+    /// 验证新增或修改 inbox.json 会单独让仓库进入本地有修改状态。
+    #[test]
+    fn reports_inbox_as_managed_local_change() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        fs::write(
+            repository.join("commands.json"),
+            document_json("已提交命令"),
+        )
+        .expect("应能写入命令文档");
+        commit_and_push_document(&repository, "加入命令数据");
+        let service = AppService::new(directory.path().join("config"));
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("干净仓库应能连接");
+        assert!(!repository_has_local_changes(&repository).expect("应能检查初始状态"));
+
+        service
+            .load_inbox_document()
+            .expect("首次读取应初始化临时收集文件");
+
+        assert!(repository_has_local_changes(&repository).expect("应能识别 Inbox 变化"));
     }
 
     /// 验证仓库中已有无效临时收集文件会报错，且不会被空文档初始化覆盖。
@@ -981,6 +1027,15 @@ mod tests {
             git_output(&repository, &["rev-parse", "HEAD"]),
             git_output(&repository, &["rev-parse", "@{u}"])
         );
+        assert!(
+            !repository.join("inbox.json").exists(),
+            "旧远端缺少 inbox.json 时拉取仍应成功，初始化延后到首次进入临时收集页"
+        );
+        let inbox = service
+            .load_inbox_document()
+            .expect("旧仓库拉取后应可兼容初始化空 Inbox");
+        assert!(inbox.initialized_empty_document);
+        assert_eq!(inbox.document, InboxDocument::empty());
     }
 
     /// 验证 CRLF 工作树使用实际文件哈希作为拉取基线，拉取后可立即保存。
@@ -1128,7 +1183,53 @@ mod tests {
         );
     }
 
-    /// 验证一次推送只提交命令数据，并可由另一克隆获得相同文档。
+    /// 验证远端 inbox.json 无效时不快进 HEAD，也不在本地创建或覆盖临时收集文件。
+    #[test]
+    fn rejects_invalid_remote_inbox_before_fast_forward() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        fs::write(
+            repository.join("commands.json"),
+            document_json("有效本地命令"),
+        )
+        .expect("应能写入本地命令文档");
+        commit_and_push_document(&repository, "加入有效命令数据");
+        let service = AppService::new(directory.path().join("config"));
+        service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("连接有效仓库应成功");
+        let before_head = git_output(&repository, &["rev-parse", "HEAD"]);
+
+        let producer = directory.path().join("producer-invalid-inbox");
+        git(
+            directory.path(),
+            &[
+                "clone",
+                directory
+                    .path()
+                    .join("remote.git")
+                    .to_string_lossy()
+                    .as_ref(),
+                "producer-invalid-inbox",
+            ],
+        );
+        fs::write(
+            producer.join("inbox.json"),
+            r#"{"schemaVersion":1,"items":[{"id":"dup","content":"一","createdAt":"t","updatedAt":"t"},{"id":"dup","content":"二","createdAt":"t","updatedAt":"t"}]}"#,
+        )
+        .expect("应能写入重复 ID 候选");
+        commit_and_push_inbox(&producer, "写入无效临时收集数据");
+
+        let error = service
+            .pull_repository()
+            .expect_err("无效远端 Inbox 不得快进到本地");
+
+        assert_eq!(error.code, "REMOTE_INBOX_INVALID");
+        assert_eq!(git_output(&repository, &["rev-parse", "HEAD"]), before_head);
+        assert!(!repository.join("inbox.json").exists());
+    }
+
+    /// 验证一次推送只提交两个受管数据文件，并可由另一克隆获得相同内容。
     #[test]
     fn commits_and_pushes_document_to_another_clone() {
         let directory = tempfile::tempdir().expect("应能创建测试目录");
@@ -1152,6 +1253,12 @@ mod tests {
             )
             .expect("本地编辑保存应成功");
         assert_eq!(saved.sync_state, SyncState::Dirty);
+        let loaded_inbox = service
+            .load_inbox_document()
+            .expect("首次读取应初始化临时收集文件");
+        let saved_inbox = service
+            .save_inbox_document(inbox_document("跨电脑同步"), &loaded_inbox.document_hash)
+            .expect("临时收集修改应保存成功");
 
         let pushed = service.push_repository().expect("普通推送应成功");
         assert_eq!(pushed.sync_state, SyncState::Synced);
@@ -1178,6 +1285,9 @@ mod tests {
         let verifier_document =
             fs::read_to_string(verifier.join("commands.json")).expect("另一克隆应能读取推送数据");
         assert!(verifier_document.contains("查看进程"));
+        let (verifier_inbox, _) = load_inbox_document(&verifier.join("inbox.json"))
+            .expect("另一克隆应能读取推送的临时收集数据");
+        assert_eq!(verifier_inbox, saved_inbox.document);
 
         let no_op = service.push_repository().expect("无变化推送应安全完成");
         assert_eq!(no_op.sync_state, SyncState::Synced);
