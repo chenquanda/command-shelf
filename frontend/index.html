@@ -2225,8 +2225,8 @@
     .inbox-item {
       position: relative;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 28px;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 18px;
       align-items: start;
       min-height: 58px;
       padding: 16px 4px 16px 0;
@@ -2271,6 +2271,55 @@
       font-size: 12px;
       white-space: nowrap;
     }
+
+    .inbox-item-actions {
+      display: flex;
+      gap: 6px;
+      align-items: flex-start;
+    }
+
+    .inbox-item-actions .action-button {
+      width: 30px;
+      height: 30px;
+      min-height: 30px;
+      border-color: transparent;
+    }
+
+    /* 行内编辑保留时间流位置，保存或取消都不会让用户跳离当前记录。 */
+    .inbox-edit-form {
+      display: grid;
+      gap: 10px;
+    }
+
+    .inbox-edit-textarea {
+      width: 100%;
+      min-height: 88px;
+      padding: 10px 12px;
+      border: 1px solid var(--paper-line-strong);
+      border-radius: 5px;
+      background: rgba(255, 255, 255, 0.28);
+      color: var(--ink);
+      font-family: var(--font-mono);
+      font-size: 14px;
+      line-height: 1.65;
+      resize: vertical;
+    }
+
+    .inbox-edit-footer {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+    }
+
+    .inbox-edit-error {
+      flex: 1;
+      margin: 0;
+      color: var(--paper-danger);
+      font-size: 12px;
+    }
+
+    .inbox-edit-footer .secondary-button { min-height: 34px; padding: 6px 12px; }
 
     @media (max-width: 1180px) {
       .app-shell { grid-template-columns: 250px minmax(0, 1fr); }
@@ -2692,6 +2741,8 @@
       loading: false,
       error: null
     };
+    /** 当前正在行内编辑的临时记录 ID；同一时间只允许编辑一条。 */
+    let editingInboxId = null;
     let editingCommandId = null;
     let draggedCommandId = null;
     let toastTimer = null;
@@ -3078,6 +3129,7 @@
       setDisabledIfChanged(newInboxButton, !canMutateData);
       setDisabledIfChanged(inboxContentInput, !canMutateData);
       setDisabledIfChanged(inboxSaveButton, !canMutateData);
+      inboxGroups.querySelectorAll("button, textarea").forEach((control) => { setDisabledIfChanged(control, !canMutateData); });
       setDisabledIfChanged(askCodexButton, !canMutateData || categories.length === 0);
       setDisabledIfChanged(copySortButton, !canMutateData || (getActiveCategory()?.commands.length || 0) < 2);
       setDisabledIfChanged(addCommandButton, !canMutateData || categories.length === 0);
@@ -3379,6 +3431,7 @@
       inboxState.loaded = false;
       inboxState.loading = false;
       inboxState.error = null;
+      editingInboxId = null;
     }
 
     /**
@@ -3761,8 +3814,24 @@
             ${group.items.map(({ item, time }) => `
               <li class="inbox-item" data-inbox-id="${escapeHtml(item.id)}">
                 <span class="inbox-marker" aria-hidden="true"></span>
-                <p class="inbox-content">${renderInboxContent(item.content)}</p>
+                ${editingInboxId === item.id ? `
+                  <form class="inbox-edit-form" data-inbox-edit-form="${escapeHtml(item.id)}" novalidate>
+                    <textarea class="inbox-edit-textarea" data-inbox-edit-input="${escapeHtml(item.id)}" aria-label="编辑临时记录内容">${escapeHtml(item.content)}</textarea>
+                    <div class="inbox-edit-footer">
+                      <p class="inbox-edit-error" data-inbox-edit-error="${escapeHtml(item.id)}" role="alert"></p>
+                      <button class="secondary-button" type="button" data-inbox-edit-cancel="${escapeHtml(item.id)}">取消</button>
+                      <button class="secondary-button" type="submit">保存修改</button>
+                    </div>
+                  </form>
+                ` : `<p class="inbox-content">${renderInboxContent(item.content)}</p>`}
                 <time class="inbox-time" datetime="${escapeHtml(item.createdAt)}">${escapeHtml(time)}</time>
+                ${editingInboxId === item.id ? "" : `
+                  <div class="inbox-item-actions">
+                    <button class="action-button icon-only" type="button" data-inbox-edit="${escapeHtml(item.id)}" aria-label="编辑这条临时记录" title="编辑">
+                      <svg class="icon" aria-hidden="true"><use href="#icon-edit"></use></svg>
+                    </button>
+                  </div>
+                `}
               </li>
             `).join("")}
           </ol>
@@ -4224,6 +4293,93 @@
       inboxComposer.requestSubmit();
     });
 
+    /**
+     * 退出行内编辑并把键盘焦点送回同一条记录的编辑入口。
+     * @param {string} itemId 需要恢复焦点的临时记录 ID。
+     * @returns {void}
+     */
+    function closeInboxEditorAndRestoreFocus(itemId) {
+      editingInboxId = null;
+      render();
+      restoreFocus([
+        inboxGroups.querySelector(`[data-inbox-edit="${CSS.escape(itemId)}"]`),
+        newInboxButton,
+        inboxContentInput
+      ]);
+    }
+
+    /** 时间流按钮委托：ATOM-06 只开放编辑与取消，不提前处理删除。 */
+    inboxGroups.addEventListener("click", (event) => {
+      const editButton = event.target.closest("[data-inbox-edit]");
+      if (editButton) {
+        if (syncState.operation) return;
+        const itemId = editButton.dataset.inboxEdit;
+        editingInboxId = itemId;
+        render();
+        window.requestAnimationFrame(() => {
+          const input = inboxGroups.querySelector(`[data-inbox-edit-input="${CSS.escape(itemId)}"]`);
+          input?.focus({ preventScroll: true });
+          input?.setSelectionRange(input.value.length, input.value.length);
+        });
+        return;
+      }
+
+      const cancelButton = event.target.closest("[data-inbox-edit-cancel]");
+      if (cancelButton) closeInboxEditorAndRestoreFocus(cancelButton.dataset.inboxEditCancel);
+    });
+
+    /** 行内编辑保存保留 ID 与创建时间，仅在内容有效时更新修改时间并安全写入。 */
+    inboxGroups.addEventListener("submit", async (event) => {
+      const form = event.target.closest("[data-inbox-edit-form]");
+      if (!form) return;
+      event.preventDefault();
+      const itemId = form.dataset.inboxEditForm;
+      const input = form.querySelector("[data-inbox-edit-input]");
+      const error = form.querySelector("[data-inbox-edit-error]");
+      const content = input.value.trim();
+      if (!content) {
+        error.textContent = "内容不能为空。";
+        input.focus();
+        return;
+      }
+      if (syncState.operation) {
+        error.textContent = "当前正在保存或同步，请稍候再试。";
+        return;
+      }
+
+      const item = inboxState.items.find((candidate) => candidate.id === itemId);
+      if (!item) {
+        closeInboxEditorAndRestoreFocus(itemId);
+        return;
+      }
+      if (content === item.content) {
+        closeInboxEditorAndRestoreFocus(itemId);
+        return;
+      }
+
+      const previousItems = structuredClone(inboxState.items);
+      item.content = content;
+      item.updatedAt = new Date().toISOString();
+      editingInboxId = null;
+      render();
+      await persistInboxMutation(previousItems, "临时记录修改已保存");
+      restoreFocus([
+        inboxGroups.querySelector(`[data-inbox-edit="${CSS.escape(itemId)}"]`),
+        newInboxButton,
+        inboxContentInput
+      ]);
+    });
+
+    /** Escape 取消当前行内编辑，阻止页面级快捷键继续处理已经关闭的编辑器。 */
+    inboxGroups.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      const form = event.target.closest("[data-inbox-edit-form]");
+      if (!form) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeInboxEditorAndRestoreFocus(form.dataset.inboxEditForm);
+    });
+
     /** 分类点击委托：切换后保持分类顺序稳定并立即刷新内容。 */
     /** 固定入口切换到独立临时收集视图，桌面首次进入时按需读取真实文件。 */
     inboxNavButton.addEventListener("click", () => {
@@ -4237,6 +4393,7 @@
       const button = event.target.closest("[data-category-id]");
       if (!button || (!inboxViewActive && button.dataset.categoryId === activeCategoryId)) return;
       inboxViewActive = false;
+      editingInboxId = null;
       activeCategoryId = button.dataset.categoryId;
       render();
     });

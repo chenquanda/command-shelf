@@ -295,6 +295,58 @@ try {
     storedItems: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items.map((item) => item.content)
   })`);
 
+  await evaluate(cdp.send, "document.querySelector('[data-inbox-edit]').click()");
+  await waitForCondition(cdp.send, "Boolean(document.querySelector('[data-inbox-edit-input]'))", "打开临时记录编辑器");
+  const cancelEvidence = await evaluate(cdp.send, `(() => {
+    const input = document.querySelector('[data-inbox-edit-input]');
+    input.value = '取消按钮不得保存';
+    document.querySelector('[data-inbox-edit-cancel]').click();
+    const stored = JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items[0];
+    return { storedContent: stored.content, visibleContent: document.querySelector('[data-inbox-id] .inbox-content')?.textContent, focusRestored: document.activeElement.matches('[data-inbox-edit]') };
+  })()`);
+
+  await evaluate(cdp.send, "document.querySelector('[data-inbox-edit]').click()");
+  await waitForCondition(cdp.send, "Boolean(document.querySelector('[data-inbox-edit-input]'))", "再次打开临时记录编辑器");
+  const escapeEvidence = await evaluate(cdp.send, `(() => {
+    const input = document.querySelector('[data-inbox-edit-input]');
+    input.value = 'Escape 不得保存';
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    return { editorClosed: !document.querySelector('[data-inbox-edit-input]'), focusRestored: document.activeElement.matches('[data-inbox-edit]') };
+  })()`);
+
+  await evaluate(cdp.send, "document.querySelector('[data-inbox-edit]').click()");
+  await waitForCondition(cdp.send, "Boolean(document.querySelector('[data-inbox-edit-input]'))", "打开空白编辑校验");
+  const emptyEditEvidence = await evaluate(cdp.send, `(() => {
+    document.querySelector('[data-inbox-edit-input]').value = '   ';
+    document.querySelector('[data-inbox-edit-form]').requestSubmit();
+    return { error: document.querySelector('[data-inbox-edit-error]').textContent, editorOpen: Boolean(document.querySelector('[data-inbox-edit-input]')) };
+  })()`);
+
+  const beforeEdit = await evaluate(cdp.send, "JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items[0]");
+  await evaluate(cdp.send, `(() => {
+    document.querySelector('[data-inbox-edit-input]').value = '已完成一次有效编辑';
+    document.querySelector('[data-inbox-edit-form]').requestSubmit();
+  })()`);
+  await waitForCondition(cdp.send, "document.querySelector('[data-inbox-id] .inbox-content')?.textContent === '已完成一次有效编辑' && !document.querySelector('#inbox-save-button').disabled", "有效编辑保存完成");
+  const editEvidence = await evaluate(cdp.send, `(() => {
+    const stored = JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items[0];
+    return { stored, visibleContent: document.querySelector('[data-inbox-id] .inbox-content')?.textContent, focusRestored: document.activeElement.matches('[data-inbox-edit]') };
+  })()`);
+
+  await evaluate(cdp.send, "document.querySelector('[data-inbox-edit]').click()");
+  await waitForCondition(cdp.send, "Boolean(document.querySelector('[data-inbox-edit-input]'))", "打开失败编辑场景");
+  await evaluate(cdp.send, `(() => {
+    window.__inboxMock.failNextSave = true;
+    document.querySelector('[data-inbox-edit-input]').value = '这次修改必须回滚';
+    document.querySelector('[data-inbox-edit-form]').requestSubmit();
+  })()`);
+  await waitForCondition(cdp.send, "document.querySelector('[data-inbox-id] .inbox-content')?.textContent === '已完成一次有效编辑' && document.activeElement.matches('[data-inbox-edit]')", "编辑保存失败完成回滚与焦点恢复");
+  const editFailureEvidence = await evaluate(cdp.send, `({
+    visibleContent: document.querySelector('[data-inbox-id] .inbox-content')?.textContent,
+    storedContent: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items[0].content,
+    focusRestored: document.activeElement.matches('[data-inbox-edit]')
+  })`);
+
   const failures = [];
   if (!readOnlyEvidence.fixedEntryBeforeCategories) failures.push("临时收集入口不在分类目录之前");
   if (readOnlyEvidence.activeEntry !== "page") failures.push("临时收集入口没有选中语义");
@@ -309,6 +361,11 @@ try {
   if (failureEvidence.count !== "3" || failureEvidence.storedCount !== 3 || failureEvidence.input !== "保存失败时保留我") failures.push("保存失败没有完整回滚并保留输入");
   if (!Object.values(busyEvidence).every(Boolean)) failures.push("保存期间没有禁用录入或同步入口");
   if (saveEvidence.count !== "4" || saveEvidence.firstContent !== "验证同步期间禁用" || saveEvidence.storedItems.length !== 4) failures.push("连续保存或重启恢复失败");
+  if (cancelEvidence.storedContent !== "验证同步期间禁用" || cancelEvidence.visibleContent !== "验证同步期间禁用" || !cancelEvidence.focusRestored) failures.push("取消编辑改变了内容或没有恢复焦点");
+  if (!escapeEvidence.editorClosed || !escapeEvidence.focusRestored) failures.push("Escape 没有取消编辑并恢复焦点");
+  if (!emptyEditEvidence.editorOpen || !emptyEditEvidence.error.includes("不能为空")) failures.push("空白编辑没有被拒绝");
+  if (editEvidence.stored.id !== beforeEdit.id || editEvidence.stored.createdAt !== beforeEdit.createdAt || editEvidence.stored.updatedAt === beforeEdit.updatedAt || editEvidence.visibleContent !== "已完成一次有效编辑" || !editEvidence.focusRestored) failures.push("有效编辑没有保持标识与创建时间或更新修改时间");
+  if (editFailureEvidence.visibleContent !== "已完成一次有效编辑" || editFailureEvidence.storedContent !== "已完成一次有效编辑" || !editFailureEvidence.focusRestored) failures.push("编辑保存失败没有回滚内容与焦点");
   if (cdp.getExceptions().length > 0) failures.push("页面运行期间出现 JavaScript 异常");
   if (failures.length > 0) throw new Error(failures.join("；"));
 
@@ -320,6 +377,11 @@ try {
     failureEvidence,
     busyEvidence,
     saveEvidence,
+    cancelEvidence,
+    escapeEvidence,
+    emptyEditEvidence,
+    editEvidence,
+    editFailureEvidence,
     viewports: [compactViewport, largeViewport],
     screenshotPath,
     runtimeExceptions: cdp.getExceptions().length,
