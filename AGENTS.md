@@ -23,6 +23,7 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 - 桌面验收脚本：`scripts/desktop-smoke.mjs`。
 - 复制无刷新回归：`scripts/复制无刷新回归.mjs`，通过隔离 Tauri 契约检查复制计数保存不替换命令卡片。
 - 发布门禁：`scripts/release-candidate.ps1`。
+- 一键安装包生成：`scripts/生成安装包.ps1`，负责专项回归、发布门禁、产物落位、启动冒烟、哈希核对和说明更新。
 - 安装包：`release/CommandShelf_0.1.0_x64-setup.exe`。
 - 本机构建缓存和临时证据统一放在 `.local`，不得提交。
 
@@ -135,10 +136,10 @@ node --check scripts\desktop-smoke.mjs
 node scripts\复制无刷新回归.mjs
 ```
 
-正式发布使用：
+正式发布使用一键入口；它会在内部调用发布门禁：
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File scripts\release-candidate.ps1
+pwsh -ExecutionPolicy Bypass -File scripts\生成安装包.ps1
 ```
 
 发布脚本会在 `.local` 下生成大量 Rust/Tauri 缓存。任务结束后如果用户要求清理，先保留需要交付的安装包，再删除 `.local` 中的缓存和验收夹具。
