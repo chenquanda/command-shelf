@@ -1,6 +1,6 @@
 /**
- * 文件职责：验证临时收集固定入口、只读时间流、日期分组和响应式边界。
- * 主要内容：使用隔离 Edge DevTools 会话驱动正式单文件前端，并保存一张临时视觉证据。
+ * 文件职责：验证临时收集固定入口、时间流、新增保存和响应式边界。
+ * 主要内容：使用隔离 Edge DevTools 会话驱动正式单文件前端，并以受控 Tauri 替身验证保存与回滚。
  * 重要约束：浏览器配置和截图只写入项目 `.local`，不读取个人配置或真实命令仓库。
  */
 
@@ -177,6 +177,8 @@ try {
       linkHref: document.querySelector('[data-inbox-id="preview-inbox-1"] a')?.href,
       commandListHidden: getComputedStyle(document.querySelector('#command-list')).display === 'none',
       commandActionsHidden: ['ask-codex-button', 'copy-sort-button', 'add-command-button'].every((id) => getComputedStyle(document.getElementById(id)).display === 'none'),
+      newInboxVisible: getComputedStyle(document.querySelector('#new-inbox-button')).display !== 'none',
+      composerVisible: getComputedStyle(document.querySelector('#inbox-composer')).display !== 'none',
       categoryCount: document.querySelectorAll('[data-category-id]').length
     };
   })()`);
@@ -195,6 +197,104 @@ try {
     return { categoryTitle, actionsVisible, returnedTitle: document.querySelector('#category-title')?.textContent };
   })()`);
 
+  /* 重载前注入最小 Tauri 契约，覆盖真实桌面保存、失败回滚、忙碌禁用和重启恢复。 */
+  await evaluate(cdp.send, "localStorage.removeItem('command-shelf-inbox-regression')");
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+    source: `(() => {
+      const storageKey = 'command-shelf-inbox-regression';
+      const readState = () => JSON.parse(localStorage.getItem(storageKey) || '{"items":[],"revision":1}');
+      const writeState = (state) => localStorage.setItem(storageKey, JSON.stringify(state));
+      window.__inboxMock = { failNextSave: false, saveDelay: 0 };
+      window.__TAURI__ = { core: { invoke: async (command, args = {}) => {
+        if (command === 'load_app') return {
+          repositoryPath: 'D:\\\\mock-command-data', syncState: 'synced', statusMessage: '测试仓库已连接。',
+          document: { schemaVersion: 1, categories: [] }, documentHash: 'commands-hash', error: null
+        };
+        if (command === 'load_inbox_document') {
+          const state = readState();
+          return { document: { schemaVersion: 1, items: state.items }, documentHash: 'inbox-hash-' + state.revision, initializedEmptyDocument: false };
+        }
+        if (command === 'save_inbox_document') {
+          if (window.__inboxMock.saveDelay > 0) await new Promise((resolve) => setTimeout(resolve, window.__inboxMock.saveDelay));
+          if (window.__inboxMock.failNextSave) {
+            window.__inboxMock.failNextSave = false;
+            throw { message: '测试保存失败', action: '请保留输入后重试。' };
+          }
+          const state = readState();
+          state.items = structuredClone(args.document.items);
+          state.revision += 1;
+          writeState(state);
+          return { document: structuredClone(args.document), documentHash: 'inbox-hash-' + state.revision, initializedEmptyDocument: false };
+        }
+        throw { message: '未实现的测试命令：' + command };
+      } } };
+    })();`
+  });
+  await cdp.send("Page.reload", { ignoreCache: true });
+  await waitForCondition(cdp.send, "document.readyState === 'complete' && document.querySelector('#repository-button')?.textContent.includes('mock-command-data')", "桌面替身完成应用启动");
+  await evaluate(cdp.send, "document.querySelector('#inbox-nav-button').click()");
+  await waitForCondition(cdp.send, "document.querySelector('#category-title')?.textContent === '临时收集' && !document.querySelector('#inbox-save-button').disabled", "桌面替身加载空临时文档");
+
+  const blankEvidence = await evaluate(cdp.send, `(() => {
+    const input = document.querySelector('#inbox-content-input');
+    input.value = '   ';
+    document.querySelector('#inbox-composer').requestSubmit();
+    return { count: document.querySelector('#inbox-nav-count').textContent, error: document.querySelector('#inbox-composer-error').textContent };
+  })()`);
+
+  await evaluate(cdp.send, `(() => {
+    document.querySelector('#inbox-content-input').value = '只记一段文字';
+    document.querySelector('#inbox-save-button').click();
+  })()`);
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-nav-count')?.textContent === '1' && !document.querySelector('#inbox-save-button').disabled", "按钮保存纯文字");
+  await evaluate(cdp.send, `(() => {
+    const input = document.querySelector('#inbox-content-input');
+    input.value = 'https://tauri.app/';
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
+  })()`);
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-nav-count')?.textContent === '2' && !document.querySelector('#inbox-save-button').disabled", "快捷键保存链接");
+  await evaluate(cdp.send, `(() => {
+    document.querySelector('#inbox-content-input').value = '稍后阅读\\nhttps://github.com/charmbracelet/glow';
+    document.querySelector('#inbox-save-button').click();
+  })()`);
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-nav-count')?.textContent === '3' && !document.querySelector('#inbox-save-button').disabled", "连续保存混合内容");
+
+  await evaluate(cdp.send, `(() => {
+    window.__inboxMock.failNextSave = true;
+    document.querySelector('#inbox-content-input').value = '保存失败时保留我';
+    document.querySelector('#inbox-save-button').click();
+  })()`);
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-composer-error')?.textContent.includes('输入内容已保留')", "保存失败完成界面回滚");
+  const failureEvidence = await evaluate(cdp.send, `({
+    count: document.querySelector('#inbox-nav-count').textContent,
+    input: document.querySelector('#inbox-content-input').value,
+    storedCount: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items.length
+  })`);
+
+  await evaluate(cdp.send, `(() => {
+    window.__inboxMock.saveDelay = 350;
+    document.querySelector('#inbox-content-input').value = '验证同步期间禁用';
+    document.querySelector('#inbox-save-button').click();
+  })()`);
+  await delay(80);
+  const busyEvidence = await evaluate(cdp.send, `({
+    inputDisabled: document.querySelector('#inbox-content-input').disabled,
+    saveDisabled: document.querySelector('#inbox-save-button').disabled,
+    pullDisabled: document.querySelector('#pull-button').disabled,
+    newDisabled: document.querySelector('#new-inbox-button').disabled
+  })`);
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-nav-count')?.textContent === '4' && !document.querySelector('#inbox-save-button').disabled", "延迟保存完成");
+
+  await cdp.send("Page.reload", { ignoreCache: true });
+  await waitForCondition(cdp.send, "document.readyState === 'complete' && document.querySelector('#repository-button')?.textContent.includes('mock-command-data')", "重启替身应用");
+  await evaluate(cdp.send, "document.querySelector('#inbox-nav-button').click()");
+  await waitForCondition(cdp.send, "document.querySelector('#inbox-nav-count')?.textContent === '4'", "重启后恢复已保存记录");
+  const saveEvidence = await evaluate(cdp.send, `({
+    count: document.querySelector('#inbox-nav-count').textContent,
+    firstContent: document.querySelector('[data-inbox-id] .inbox-content')?.textContent,
+    storedItems: JSON.parse(localStorage.getItem('command-shelf-inbox-regression')).items.map((item) => item.content)
+  })`);
+
   const failures = [];
   if (!readOnlyEvidence.fixedEntryBeforeCategories) failures.push("临时收集入口不在分类目录之前");
   if (readOnlyEvidence.activeEntry !== "page") failures.push("临时收集入口没有选中语义");
@@ -202,8 +302,13 @@ try {
   if (!readOnlyEvidence.groupLabels.includes("今天") || !readOnlyEvidence.groupLabels.includes("昨天")) failures.push("今天或昨天分组缺失");
   if (!readOnlyEvidence.linkHref?.startsWith("https://github.com/")) failures.push("内容链接没有转换为安全链接");
   if (!readOnlyEvidence.commandListHidden || !readOnlyEvidence.commandActionsHidden) failures.push("分类页控件仍显示在临时收集页");
+  if (!readOnlyEvidence.newInboxVisible || !readOnlyEvidence.composerVisible) failures.push("新建速记入口或录入区不可见");
   if (compactViewport.hasHorizontalOverflow || largeViewport.hasHorizontalOverflow) failures.push("目标视口出现横向溢出");
   if (navigationEvidence.categoryTitle !== "Linux" || !navigationEvidence.actionsVisible || navigationEvidence.returnedTitle !== "临时收集") failures.push("分类与临时收集往返失败");
+  if (blankEvidence.count !== "0" || !blankEvidence.error.includes("请先输入")) failures.push("空白内容未被拒绝");
+  if (failureEvidence.count !== "3" || failureEvidence.storedCount !== 3 || failureEvidence.input !== "保存失败时保留我") failures.push("保存失败没有完整回滚并保留输入");
+  if (!Object.values(busyEvidence).every(Boolean)) failures.push("保存期间没有禁用录入或同步入口");
+  if (saveEvidence.count !== "4" || saveEvidence.firstContent !== "验证同步期间禁用" || saveEvidence.storedItems.length !== 4) failures.push("连续保存或重启恢复失败");
   if (cdp.getExceptions().length > 0) failures.push("页面运行期间出现 JavaScript 异常");
   if (failures.length > 0) throw new Error(failures.join("；"));
 
@@ -211,6 +316,10 @@ try {
     status: "passed",
     readOnlyEvidence,
     navigationEvidence,
+    blankEvidence,
+    failureEvidence,
+    busyEvidence,
+    saveEvidence,
     viewports: [compactViewport, largeViewport],
     screenshotPath,
     runtimeExceptions: cdp.getExceptions().length,

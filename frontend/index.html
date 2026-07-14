@@ -1,6 +1,6 @@
 <!--
   文件职责：提供 CommandShelf 正式 Tauri 桌面前端，并保留浏览器独立预览能力。
-  主要内容：展示与维护真实命令文档、连接本地数据仓库，并通过本机 Codex CLI 生成临时命令草稿。
+  主要内容：展示与维护真实命令文档和临时收集内容、连接本地数据仓库，并通过本机 Codex CLI 生成临时命令草稿。
   重要约束：桌面模式只能通过显式 Tauri 命令访问文件；Codex 结果只展示不执行，用户确认前不写入命令数据。
 -->
 <!doctype html>
@@ -2136,6 +2136,61 @@
 
     .inbox-view[hidden] { display: none; }
 
+    /* 速记录入区只承载一段原始文本，避免让文字、链接等内容类型增加额外决策。 */
+    .inbox-composer {
+      display: grid;
+      gap: 14px;
+      margin-bottom: 34px;
+      padding: 22px 24px 18px;
+      border: 1px solid var(--paper-line-strong);
+      border-radius: 7px;
+      background: rgba(255, 255, 255, 0.18);
+    }
+
+    .inbox-composer textarea {
+      width: 100%;
+      min-height: 92px;
+      resize: vertical;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: var(--ink);
+      font-family: var(--font-mono);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+
+    .inbox-composer textarea::placeholder { color: var(--ink-faint); }
+
+    .inbox-composer-footer {
+      display: flex;
+      gap: 18px;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .inbox-composer-hint {
+      margin: 0;
+      color: var(--ink-faint);
+      font-size: 13px;
+    }
+
+    .inbox-composer-hint kbd {
+      padding: 2px 7px;
+      border: 1px solid var(--paper-line-strong);
+      border-radius: 4px;
+      background: var(--paper-soft);
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+
+    .inbox-composer-error {
+      min-height: 20px;
+      margin: -6px 0 0;
+      color: var(--paper-danger);
+      font-size: 13px;
+    }
+
     .inbox-state {
       min-height: 240px;
       display: grid;
@@ -2308,6 +2363,9 @@
           <p class="header-description" id="category-description">容器日常查看、排障和清理时最常用的一组命令。</p>
         </div>
         <div class="workspace-actions">
+          <button class="primary-button" id="new-inbox-button" type="button" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>新建速记
+          </button>
           <button class="secondary-button codex-entry-button" id="ask-codex-button" type="button">
             <svg class="icon" aria-hidden="true"><use href="#icon-terminal"></use></svg>问 Codex
           </button>
@@ -2320,6 +2378,14 @@
         </div>
       </header>
       <section class="inbox-view" id="inbox-view" aria-label="临时收集记录" hidden>
+        <form class="inbox-composer" id="inbox-composer" novalidate>
+          <textarea id="inbox-content-input" maxlength="100000" placeholder="现在想到什么？" aria-describedby="inbox-composer-hint inbox-composer-error"></textarea>
+          <div class="inbox-composer-footer">
+            <p class="inbox-composer-hint" id="inbox-composer-hint">支持文字或链接，<kbd>Ctrl + Enter</kbd> 保存</p>
+            <button class="secondary-button" id="inbox-save-button" type="submit">记下来</button>
+          </div>
+          <p class="inbox-composer-error" id="inbox-composer-error" role="alert"></p>
+        </form>
         <div class="inbox-state" id="inbox-state" hidden></div>
         <div class="inbox-groups" id="inbox-groups"></div>
       </section>
@@ -2688,6 +2754,11 @@
     /** DOM 引用集中声明，避免后续交互逻辑重复查询并保持职责清晰。 */
     const inboxNavButton = document.getElementById("inbox-nav-button");
     const inboxNavCount = document.getElementById("inbox-nav-count");
+    const newInboxButton = document.getElementById("new-inbox-button");
+    const inboxComposer = document.getElementById("inbox-composer");
+    const inboxContentInput = document.getElementById("inbox-content-input");
+    const inboxSaveButton = document.getElementById("inbox-save-button");
+    const inboxComposerError = document.getElementById("inbox-composer-error");
     const categoryList = document.getElementById("category-list");
     const commandList = document.getElementById("command-list");
     const emptyState = document.getElementById("empty-state");
@@ -3004,6 +3075,9 @@
       setDisabledIfChanged(pushButton, isBusy || !hasUsableRepository || !syncState.hasLocalChanges);
       setDisabledIfChanged(repositoryButton, isBusy);
       setDisabledIfChanged(addCategoryButton, !canMutateData);
+      setDisabledIfChanged(newInboxButton, !canMutateData);
+      setDisabledIfChanged(inboxContentInput, !canMutateData);
+      setDisabledIfChanged(inboxSaveButton, !canMutateData);
       setDisabledIfChanged(askCodexButton, !canMutateData || categories.length === 0);
       setDisabledIfChanged(copySortButton, !canMutateData || (getActiveCategory()?.commands.length || 0) < 2);
       setDisabledIfChanged(addCommandButton, !canMutateData || categories.length === 0);
@@ -3367,6 +3441,54 @@
     }
 
     /**
+     * 保存一次已经应用到内存时间流的修改；桌面失败时恢复旧数组，浏览器预览只标记本地修改。
+     * @param {Array<object>} previousItems 修改前的临时记录深拷贝。
+     * @param {string} successMessage 保存成功后的简短反馈。
+     * @returns {Promise<boolean>} 成功持久化或浏览器预览完成时返回 true。
+     */
+    async function persistInboxMutation(previousItems, successMessage) {
+      if (!isDesktopRuntime) {
+        markLocalChanges();
+        render();
+        return true;
+      }
+      if (!inboxState.documentHash) {
+        inboxState.items = previousItems;
+        syncState.error = "缺少最近有效的 inbox.json 哈希，保存已停止。";
+        syncState.statusMessage = "请重新进入临时收集页加载数据后再试。";
+        render();
+        showToastFeedback("保存失败，记录未改变", "error", 2600);
+        return false;
+      }
+
+      syncState.operation = "save";
+      syncState.error = null;
+      syncState.statusMessage = "正在备份并原子写入 inbox.json。";
+      render();
+      try {
+        const snapshot = await window.__TAURI__.core.invoke("save_inbox_document", {
+          document: { schemaVersion: 1, items: inboxState.items },
+          expectedHash: inboxState.documentHash
+        });
+        applyInboxSnapshot(snapshot);
+        syncState.operation = null;
+        syncState.hasLocalChanges = true;
+        syncState.statusMessage = "临时收集内容已保存到本地，等待推送。";
+        render();
+        showToastFeedback(successMessage);
+        return true;
+      } catch (error) {
+        inboxState.items = previousItems;
+        syncState.operation = null;
+        syncState.error = [error?.message, error?.action].filter(Boolean).join(" ") || "临时记录保存失败。";
+        syncState.statusMessage = "磁盘中的最后有效 inbox.json 未被覆盖。";
+        render();
+        showToastFeedback("保存失败，记录未改变", "error", 2800);
+        return false;
+      }
+    }
+
+    /**
      * 执行显式拉取或推送；桌面拉取调用 Rust 安全快进协议，浏览器预览保留短暂模拟。
      * @param {"pull"|"push"} operation 用户主动选择的同步操作。
      * @returns {Promise<void>} 操作结束或安全停止后完成。
@@ -3609,6 +3731,7 @@
       categoryTitle.textContent = "临时收集";
       categoryCount.textContent = `${inboxState.items.length} 条`;
       categoryDescription.textContent = "随手记，处理完就删掉。";
+      newInboxButton.hidden = false;
       askCodexButton.hidden = true;
       copySortButton.hidden = true;
       addCommandButton.hidden = true;
@@ -3654,6 +3777,7 @@
         return;
       }
       inboxView.hidden = true;
+      newInboxButton.hidden = true;
       askCodexButton.hidden = false;
       copySortButton.hidden = false;
       addCommandButton.hidden = false;
@@ -4051,6 +4175,54 @@
       if (renderedButton) showCopiedFeedback(renderedButton, resultMessage);
       else showToastFeedback(resultMessage, "error", 2400);
     }
+
+    /** 顶部“新建速记”只把焦点送入唯一录入框，不创建额外弹窗或内容类型。 */
+    newInboxButton.addEventListener("click", () => {
+      inboxContentInput.focus();
+      inboxContentInput.scrollIntoView({ block: "nearest" });
+    });
+
+    /**
+     * 把一段非空文字作为新记录插入数组顶部，并通过独立 inbox.json 保存契约持久化。
+     * 保存失败时输入内容保持不变，方便用户直接重试；成功后才清空录入框。
+     */
+    inboxComposer.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const content = inboxContentInput.value.trim();
+      if (!content) {
+        inboxComposerError.textContent = "请先输入要记下的文字或链接。";
+        inboxContentInput.focus();
+        return;
+      }
+      if (syncState.operation || !syncState.repositoryAvailable) {
+        inboxComposerError.textContent = syncState.operation
+          ? "当前正在保存或同步，请稍候再试。"
+          : "请先连接可用的数据仓库。";
+        return;
+      }
+
+      inboxComposerError.textContent = "";
+      const previousItems = structuredClone(inboxState.items);
+      const timestamp = new Date().toISOString();
+      inboxState.items.unshift({
+        id: `inbox-${crypto.randomUUID()}`,
+        content,
+        createdAt: timestamp,
+        updatedAt: timestamp
+      });
+      render();
+      const saved = await persistInboxMutation(previousItems, "临时记录已保存");
+      if (saved) inboxContentInput.value = "";
+      else inboxComposerError.textContent = "保存失败，输入内容已保留，可以直接重试。";
+      inboxContentInput.focus();
+    });
+
+    /** 录入框使用 Ctrl + Enter 触发表单原生提交，确保按钮和键盘共享同一校验与保存路径。 */
+    inboxContentInput.addEventListener("keydown", (event) => {
+      if (!event.ctrlKey || event.key !== "Enter") return;
+      event.preventDefault();
+      inboxComposer.requestSubmit();
+    });
 
     /** 分类点击委托：切换后保持分类顺序稳定并立即刷新内容。 */
     /** 固定入口切换到独立临时收集视图，桌面首次进入时按需读取真实文件。 */
