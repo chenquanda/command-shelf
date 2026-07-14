@@ -8,15 +8,15 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 
 ## 首次接手顺序
 
-1. 阅读本文件、`项目说明.md` 和 `docs/安装与使用说明.md`。
+1. 阅读本文件、`README.md` 和 `docs/安装与使用说明.md`。
 2. 执行 `git status -sb`，确认用户改动和当前分支状态。
 3. 根据任务只读取相关模块，不恢复已经删除的原型、阶段截图或开发过程文档。
 4. 修改前确认任务针对程序仓库还是数据仓库，两者不要混用。
 
 ## 仓库与目录
 
-- 程序仓库：`git@github.com:chenquanda/command-shelf.git`。
-- 数据仓库：`git@github.com:chenquanda/command-shelf-data.git`。
+- 程序仓库：`git@github.com:C-Q-D/command-shelf.git`。
+- 数据仓库：`git@github.com:C-Q-D/command-shelf-data.git`。
 - 正式前端：`frontend/index.html`，为无构建步骤的单文件 HTML、CSS 和 JavaScript。
 - Tauri 后端：`src-tauri/src`。
 - Tauri 配置：`src-tauri/tauri.conf.json`。
@@ -31,7 +31,7 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 
 ## 技术栈与运行边界
 
-- Rust 2021，最低 Rust 版本为 1.77.2。
+- Rust 2021；`Cargo.toml` 声明 `rust-version = 1.77.2`，当前发布实际验证工具链为 Rust/Cargo 1.96.1。
 - Tauri 2，Windows 桌面壳使用 WebView2。
 - 前端没有 Node 构建流程；Node 只用于桌面验收脚本和前端语法检查。
 - Git 同步由 Rust 后端调用系统 `git.exe`，不使用 GitHub API。
@@ -44,6 +44,7 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 
 - `app_service.rs`：编排配置、文档保存、拉取和推送用例。
 - `command_store.rs`：读取、校验和序列化 `commands.json`。
+- `inbox_store.rs`：读取、校验、初始化和序列化 `inbox.json`。
 - `git_repository.rs`：验证仓库、运行受控 Git 命令并处理超时和错误分类。
 - `process_runner.rs`：统一执行带超时、输出上限和进程树终止能力的受控子进程。
 - `codex_cli.rs`：识别本机 Codex CLI，并在隔离、只读、一次性会话中生成命令草稿。
@@ -82,11 +83,28 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 - `parameters`：参数数组；每项的 `name` 和 `description` 必须同时非空。
 - `copyCount`：非负整数，表示命令正文成功复制并完成本地保存的累计次数；旧数据缺失时按 `0` 读取。
 
+临时收集文档根结构：
+
+```json
+{
+  "schemaVersion": 1,
+  "items": []
+}
+```
+
+临时记录字段：
+
+- `id`：非空且文档内唯一，正式新增时使用 `inbox-<UUID>`。
+- `content`：必填且去除首尾空白后非空，允许换行、文字和 HTTP(S) 链接混排。
+- `createdAt`：首次保存时生成的 UTC ISO 8601 时间，编辑时保持不变。
+- `updatedAt`：最近一次保存的 UTC ISO 8601 时间，首次新增时与 `createdAt` 相同。
+- `items`：有序数组；新增插入顶部，数组顺序就是时间流顺序。
+
 文档最大 10 MB。保存时统一使用两空格缩进、LF 和结尾换行。不要随意改变字段名或 `schemaVersion`；格式升级必须同时提供兼容或迁移方案和测试。
 
 ## 加载与保存行为
 
-- 应用在启动、选择仓库和拉取成功后读取并完整校验 `commands.json`。
+- 应用在启动和选择仓库后读取并完整校验 `commands.json`；首次进入临时收集页时按需读取或初始化 `inbox.json`；拉取成功后重新加载两份数据。
 - 应用不监听外部文件实时变化。手动修改 JSON 后需要重启、重新选择仓库或完成一次有效拉取。
 - 界面新增、编辑、复制次数和排序会先保存本地文件，再更新同步状态。
 - 只有复制正式命令正文会增加 `copyCount`；复制参考输出或尚未保存的 Codex 临时结果不计数。
@@ -94,6 +112,7 @@ CommandShelf 是一个个人使用的 Windows 常用命令看板。用户把 Lin
 - “按次数排序”只在用户点击后按复制次数降序保存，同次数条目保持原相对顺序，不自动或定时重排。
 - 保存前必须核对文档基线，外部文件已经变化时拒绝覆盖。
 - 无效远端数据不能替换当前可用数据。
+- 临时记录新增、编辑和删除都使用独立哈希基线、备份和原子写入；失败时恢复记录、顺序和焦点。
 
 ## Codex 草稿规则
 
@@ -134,6 +153,7 @@ cargo test --manifest-path src-tauri\Cargo.toml --all-targets
 cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
 node --check scripts\desktop-smoke.mjs
 node scripts\复制无刷新回归.mjs
+node scripts\临时收集回归.mjs
 ```
 
 正式发布使用一键入口；它会在内部调用发布门禁：
@@ -150,6 +170,7 @@ pwsh -ExecutionPolicy Bypass -File scripts\生成安装包.ps1
 - 保存变化：覆盖原子写入、备份、外部基线变化和重启恢复。
 - Git 变化：覆盖正常拉取/推送、远端领先、本地未提交、身份/认证/网络失败、进程超时和同步期间窗口响应。
 - 复制统计变化：覆盖旧数据默认零、正文复制计数、参考输出不计数、重启恢复和手动次数排序。
+- 临时收集变化：覆盖初始化、文字/链接新增、日期分组、编辑取消、确认删除、失败回滚、重启恢复和同步期间禁用。
 - Codex 变化：覆盖 CLI 存在/缺失、合法 JSON、单次格式重试、二次失败原文、工具调用拒绝、超时和临时结果不落盘。
 - UI 变化：至少检查 1440×1024、1024×768、最小窗口、无横向溢出和长内容纵向滚动。
 - 键盘变化：检查模态焦点圈、Escape 返回原入口、保存后焦点恢复及 `Alt+↑`、`Alt+↓` 排序。

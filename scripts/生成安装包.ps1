@@ -208,7 +208,7 @@ $releaseDirectory = Join-Path $repositoryRoot "release"
 $destinationInstaller = Join-Path $releaseDirectory "CommandShelf_0.1.0_x64-setup.exe"
 $documentsWithInstallerHash = @(
     (Join-Path $repositoryRoot "AGENTS.md"),
-    (Join-Path $repositoryRoot "项目说明.md"),
+    (Join-Path $repositoryRoot "README.md"),
     (Join-Path $repositoryRoot "docs\安装与使用说明.md")
 )
 
