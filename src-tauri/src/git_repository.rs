@@ -95,6 +95,15 @@ pub enum PullPreparationOutcome {
     },
 }
 
+/// 推送准备阶段的结果；冲突时保留本机提交并把固定三方快照交给上层窗口。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushPreparationOutcome {
+    /// 普通推送已经完成，或本地与远端原本就一致。
+    Completed(PushOutcome),
+    /// 接入远端时受管文件冲突，仓库已退出 rebase 且尚未执行 push。
+    Conflict(Box<RepositoryConflictSnapshot>),
+}
+
 /// Git 业务层沿用受控进程的有限捕获结果。
 type GitOutput = ProcessOutput;
 
@@ -964,23 +973,6 @@ pub fn rebase_or_capture_conflict(
     Ok(RebasePreparationOutcome::Conflict(Box::new(snapshot)))
 }
 
-/// 保留旧同步接口的安全停止行为，直到上层完成冲突窗口接入。
-fn rebase_onto_validated_upstream(repository: &Path, upstream_oid: &str) -> Result<(), AppError> {
-    if matches!(
-        rebase_or_capture_conflict(repository, upstream_oid)?,
-        RebasePreparationOutcome::Rebased
-    ) {
-        return Ok(());
-    }
-
-    Err(AppError::new(
-        "GIT_DIVERGED",
-        "本地修改与远端更新存在冲突，自动同步已停止。",
-        "本地提交和数据均已保留；应用内冲突窗口接入后即可继续处理。",
-        false,
-    ))
-}
-
 /// 使用已经过用户确认的完整文档完成冲突 rebase，并创建普通的受管数据提交。
 ///
 /// 参数中的提交 OID 来自冲突会话；任一引用已经变化时会拒绝套用旧决议。
@@ -1055,15 +1047,28 @@ fn sync_commit_message() -> Result<String, AppError> {
 
 /// 执行显式安全推送：只提交数据文件，接入已校验远端更新，并且永不强制覆盖。
 pub fn push_repository(repository: &Path) -> Result<PushOutcome, AppError> {
+    match prepare_push_repository(repository)? {
+        PushPreparationOutcome::Completed(outcome) => Ok(outcome),
+        PushPreparationOutcome::Conflict(_) => Err(AppError::new(
+            "GIT_DIVERGED",
+            "本地修改与远端更新存在冲突，推送已停止。",
+            "本地提交和数据均已保留；请在应用内确认合并结果后继续。",
+            false,
+        )),
+    }
+}
+
+/// 执行支持应用内冲突窗口的推送准备；真实冲突发生前保持原普通推送路径不变。
+pub fn prepare_push_repository(repository: &Path) -> Result<PushPreparationOutcome, AppError> {
     ensure_empty_index(repository)?;
     ensure_no_unrelated_changes(repository)?;
     let ahead_before_commit = local_ahead_count(repository)?;
     let committed = commit_managed_documents(repository)?;
     if !committed && ahead_before_commit == 0 {
-        return Ok(PushOutcome {
+        return Ok(PushPreparationOutcome::Completed(PushOutcome {
             committed: false,
             pushed: false,
-        });
+        }));
     }
 
     require_success(
@@ -1075,14 +1080,19 @@ pub fn push_repository(repository: &Path) -> Result<PushOutcome, AppError> {
     let upstream_is_ancestor = is_ancestor(repository, &upstream_oid, "HEAD")?;
     if !upstream_is_ancestor {
         validate_commit_documents(repository, &upstream_oid)?;
-        rebase_onto_validated_upstream(repository, &upstream_oid)?;
+        match rebase_or_capture_conflict(repository, &upstream_oid)? {
+            RebasePreparationOutcome::Rebased => {}
+            RebasePreparationOutcome::Conflict(snapshot) => {
+                return Ok(PushPreparationOutcome::Conflict(snapshot));
+            }
+        }
     }
     require_success(run_git(repository, &["push"])?, "推送受管数据")?;
     // `git push` 的零退出码就是远端接受提交的提交点；其后不再运行可能失败的状态确认。
-    Ok(PushOutcome {
+    Ok(PushPreparationOutcome::Completed(PushOutcome {
         committed,
         pushed: true,
-    })
+    }))
 }
 
 #[cfg(test)]

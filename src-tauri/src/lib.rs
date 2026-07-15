@@ -200,6 +200,34 @@ async fn complete_pull_conflict(
     .await
 }
 
+/// 启动支持三栏冲突窗口的推送；无冲突时完成普通推送，有冲突时返回固定会话。
+#[tauri::command]
+async fn start_push_repository(
+    state: State<'_, RuntimeState>,
+) -> Result<SyncOperationResult, AppError> {
+    run_blocking_app_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        |app_service| app_service.start_push_repository(),
+    )
+    .await
+}
+
+/// 应用推送冲突决议并继续普通 `git push`，不会使用强制推送。
+#[tauri::command]
+async fn complete_push_conflict(
+    session: SyncConflictSession,
+    decisions: Vec<MergeDecision>,
+    state: State<'_, RuntimeState>,
+) -> Result<AppSnapshot, AppError> {
+    run_blocking_app_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        move |app_service| app_service.complete_push_conflict(session, &decisions),
+    )
+    .await
+}
+
 /// 显式提交、接入远端更新并普通推送当前命令数据，成功后返回重新计算的同步状态。
 ///
 /// 副作用：可能创建或重放本地提交并访问 `origin`；不会暂存其他文件、解决冲突或使用强制推送。
@@ -250,6 +278,8 @@ pub fn run() {
             start_pull_repository,
             complete_pull_conflict,
             push_repository,
+            start_push_repository,
+            complete_push_conflict,
             get_codex_cli_status,
             generate_command_draft
         ])
