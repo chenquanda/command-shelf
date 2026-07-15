@@ -10,14 +10,20 @@ use crate::config_store::{load_config, save_config, AppConfig};
 use crate::error::AppError;
 use crate::file_io::atomic_write;
 use crate::git_repository::{
-    pull_repository as git_pull_repository, push_repository as git_push_repository,
-    repository_has_local_changes, validate_repository, RepositoryInfo,
+    complete_conflict_rebase, prepare_pull_repository, pull_repository as git_pull_repository,
+    push_repository as git_push_repository, repository_has_local_changes, validate_repository,
+    PullPreparationOutcome, RepositoryInfo,
 };
 use crate::inbox_store::{
     initialize_empty_inbox_document, load_inbox_document, serialize_inbox_document,
     validate_inbox_document,
 };
+use crate::merge_engine::{
+    apply_command_decisions, apply_inbox_decisions, merge_command_documents, merge_inbox_documents,
+    CommandMergePlan, InboxMergePlan, MergeDecision,
+};
 use crate::model::{AppSnapshot, CommandDocument, InboxDocument, InboxSnapshot, SyncState};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// 桌面应用用例服务；配置目录可注入以支持隔离测试。
@@ -25,6 +31,54 @@ use std::path::{Path, PathBuf};
 pub struct AppService {
     /// 当前服务实例读写的机器配置目录。
     config_directory: PathBuf,
+}
+
+/// 一次待完成冲突会话最初由拉取还是推送触发。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncOperationKind {
+    /// 用户点击了拉取；确认后保留本地合并提交等待主动推送。
+    Pull,
+    /// 用户点击了推送；确认后还要继续执行普通 `git push`。
+    Push,
+}
+
+/// 前端三栏窗口消费并原样带回的固定冲突会话。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConflictSession {
+    /// 触发冲突的用户操作。
+    pub operation: SyncOperationKind,
+    /// 共同祖先提交 OID，仅用于展示会话完整性和后续诊断。
+    pub base_oid: String,
+    /// 自动提交本机数据后的固定本机 OID。
+    pub local_oid: String,
+    /// fetch 后已校验的固定远端 OID。
+    pub upstream_oid: String,
+    /// `commands.json` 的自动结果、差异和待选择字段。
+    pub command_plan: CommandMergePlan,
+    /// `inbox.json` 的自动结果、差异和待选择记录。
+    pub inbox_plan: InboxMergePlan,
+    /// 两份文档已自动处理的变化总数。
+    pub automatic_count: usize,
+    /// 两份文档仍需用户选择的冲突总数。
+    pub conflict_count: usize,
+}
+
+/// 一次显式同步的前端结果：已完成，或需要打开应用内冲突窗口。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum SyncOperationResult {
+    /// 同步没有真实冲突，直接返回新的应用快照。
+    Completed {
+        /// 同步成功后的完整应用快照。
+        snapshot: AppSnapshot,
+    },
+    /// 仓库已恢复干净，前端应展示三栏冲突窗口。
+    Conflict {
+        /// 固定三方内容生成的语义合并会话。
+        session: Box<SyncConflictSession>,
+    },
 }
 
 impl AppService {
@@ -228,6 +282,134 @@ impl AppService {
         Ok(snapshot)
     }
 
+    /// 启动一次支持应用内冲突窗口的拉取。
+    ///
+    /// 无冲突时返回成功快照；受管文件冲突时 Git 已恢复干净，并返回固定三方语义合并会话。
+    pub fn start_pull_repository(&self) -> Result<SyncOperationResult, AppError> {
+        let config = load_config(&self.config_directory)?.ok_or_else(|| {
+            AppError::new(
+                "REPO_NOT_CONFIGURED",
+                "当前电脑尚未选择数据仓库。",
+                "先连接已经克隆到本机的个人数据仓库。",
+                false,
+            )
+        })?;
+        let repository = validate_repository(Path::new(&config.repository_path))?;
+        let document_path = repository.root.join("commands.json");
+        let inbox_path = repository.root.join("inbox.json");
+        let baseline_document = load_document(&document_path)?;
+        match prepare_pull_repository(&repository.root)? {
+            PullPreparationOutcome::Completed(outcome) => {
+                let (document, document_hash) = if outcome.updated {
+                    load_document(&document_path)?
+                } else {
+                    baseline_document
+                };
+                if inbox_path.exists() {
+                    load_inbox_document(&inbox_path)?;
+                }
+                let mut snapshot = success_snapshot(
+                    repository,
+                    document,
+                    document_hash,
+                    false,
+                    outcome.has_local_changes,
+                );
+                snapshot.status_message = match (outcome.updated, outcome.has_local_changes) {
+                    (true, true) => "已接入远端更新，本地修改仍待推送。",
+                    (true, false) => "已拉取并加载远端最新命令。",
+                    (false, true) => "远端没有新更新，本地修改仍待推送。",
+                    (false, false) => "本地数据已经是远端最新版本。",
+                }
+                .to_string();
+                Ok(SyncOperationResult::Completed { snapshot })
+            }
+            PullPreparationOutcome::Conflict { snapshot, .. } => {
+                let command_plan = merge_command_documents(
+                    &snapshot.base_commands,
+                    &snapshot.local_commands,
+                    &snapshot.remote_commands,
+                )?;
+                let inbox_plan = merge_inbox_documents(
+                    &snapshot.base_inbox,
+                    &snapshot.local_inbox,
+                    &snapshot.remote_inbox,
+                )?;
+                let automatic_count = command_plan.automatic_count + inbox_plan.automatic_count;
+                let conflict_count = command_plan.conflict_count + inbox_plan.conflict_count;
+                Ok(SyncOperationResult::Conflict {
+                    session: Box::new(SyncConflictSession {
+                        operation: SyncOperationKind::Pull,
+                        base_oid: snapshot.base_oid,
+                        local_oid: snapshot.local_oid,
+                        upstream_oid: snapshot.upstream_oid,
+                        command_plan,
+                        inbox_plan,
+                        automatic_count,
+                        conflict_count,
+                    }),
+                })
+            }
+        }
+    }
+
+    /// 应用三栏窗口中的全部决议并完成拉取；合并提交保留在本机等待用户主动推送。
+    ///
+    /// 副作用：创建应用外备份、重放本机提交、原子写入两份有效文档并创建普通本地提交。
+    pub fn complete_pull_conflict(
+        &self,
+        session: SyncConflictSession,
+        decisions: &[MergeDecision],
+    ) -> Result<AppSnapshot, AppError> {
+        if session.operation != SyncOperationKind::Pull {
+            return Err(AppError::new(
+                "MERGE_DECISION_INVALID",
+                "当前冲突会话不是由拉取操作创建。",
+                "关闭窗口并重新点击拉取。",
+                true,
+            ));
+        }
+        let config = load_config(&self.config_directory)?.ok_or_else(|| {
+            AppError::new(
+                "REPO_NOT_CONFIGURED",
+                "当前电脑尚未选择数据仓库。",
+                "重新连接数据仓库后再同步。",
+                false,
+            )
+        })?;
+        let repository = validate_repository(Path::new(&config.repository_path))?;
+        let command_decisions: Vec<MergeDecision> = decisions
+            .iter()
+            .filter(|decision| !decision.resolution_id.starts_with("inbox:"))
+            .cloned()
+            .collect();
+        let inbox_decisions: Vec<MergeDecision> = decisions
+            .iter()
+            .filter(|decision| decision.resolution_id.starts_with("inbox:"))
+            .cloned()
+            .collect();
+        let commands = apply_command_decisions(session.command_plan, &command_decisions)?;
+        let inbox = apply_inbox_decisions(session.inbox_plan, &inbox_decisions)?;
+        let document_path = repository.root.join("commands.json");
+        let inbox_path = repository.root.join("inbox.json");
+        backup_document(&self.config_directory, &repository.root, &document_path)?;
+        if inbox_path.exists() {
+            backup_inbox_document(&self.config_directory, &repository.root, &inbox_path)?;
+        }
+        complete_conflict_rebase(
+            &repository.root,
+            &session.local_oid,
+            &session.upstream_oid,
+            &commands,
+            &inbox,
+        )?;
+        let (document, document_hash) = load_document(&document_path)?;
+        load_inbox_document(&inbox_path)?;
+        let mut snapshot = success_snapshot(repository, document, document_hash, false, true);
+        snapshot.status_message = "冲突已合并，本地修改仍待推送。".to_string();
+        Ok(snapshot)
+    }
+
     /// 保存范围校验通过后，只提交两个受管数据文件，接入已校验远端更新并执行普通推送。
     ///
     /// 副作用：可能创建一个本地 Git 提交并访问 `origin`；成功推送后不再执行状态确认查询。
@@ -367,11 +549,12 @@ fn error_snapshot(repository_path: Option<String>, error: AppError) -> AppSnapsh
 mod tests {
     //! 测试职责：使用临时裸仓库和本地克隆验证数据持久化、同步与失败恢复闭环。
 
-    use super::AppService;
+    use super::{AppService, SyncOperationResult};
     use crate::command_store::{load_document, serialize_document};
     use crate::config_store::{save_config, AppConfig};
     use crate::git_repository::repository_has_local_changes;
     use crate::inbox_store::{load_inbox_document, serialize_inbox_document};
+    use crate::merge_engine::{MergeDecision, MergeDecisionChoice};
     use crate::model::SyncState;
     use crate::model::{CommandCategory, CommandDocument, CommandEntry};
     use crate::model::{InboxDocument, InboxEntry};
@@ -1568,6 +1751,100 @@ mod tests {
                 .expect("推送后应保留远端 Inbox")
                 .0,
             InboxDocument::empty()
+        );
+    }
+
+    /// 验证拉取冲突会返回三栏会话，并能按用户选择生成保留双方非冲突变化的本地提交。
+    #[test]
+    fn completes_pull_conflict_from_structured_decision() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        fs::write(
+            repository.join("commands.json"),
+            document_json("共同基线命令"),
+        )
+        .expect("应能写入共同基线");
+        commit_and_push_document(&repository, "加入共同基线");
+        let service = AppService::new(directory.path().join("config"));
+        let connected = service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("连接干净仓库应成功");
+        let producer = directory.path().join("producer");
+        git(
+            directory.path(),
+            &[
+                "clone",
+                directory
+                    .path()
+                    .join("remote.git")
+                    .to_string_lossy()
+                    .as_ref(),
+                "producer",
+            ],
+        );
+        fs::write(
+            producer.join("commands.json"),
+            document_json("远端最终标题"),
+        )
+        .expect("应能写入远端冲突版本");
+        commit_and_push_document(&producer, "加入远端修改");
+
+        service
+            .save_document(
+                edited_document_with_title("本机最终标题"),
+                connected
+                    .document_hash
+                    .as_deref()
+                    .expect("连接快照应有哈希"),
+            )
+            .expect("本机冲突版本应保存");
+        let started = service
+            .start_pull_repository()
+            .expect("冲突拉取应返回结构化会话");
+        let SyncOperationResult::Conflict { session } = started else {
+            panic!("同一标题的不同修改必须打开冲突窗口");
+        };
+        assert!(session.automatic_count >= 1);
+        assert_eq!(session.conflict_count, 1);
+        let title_resolution = session
+            .command_plan
+            .records
+            .iter()
+            .flat_map(|record| &record.fields)
+            .find(|field| field.key == "title")
+            .expect("应存在标题冲突")
+            .resolution_id
+            .clone();
+
+        let completed = service
+            .complete_pull_conflict(
+                *session,
+                &[MergeDecision {
+                    resolution_id: title_resolution,
+                    choice: MergeDecisionChoice::Remote,
+                    custom_value: None,
+                }],
+            )
+            .expect("选择远端标题后应完成本地合并");
+
+        assert_eq!(completed.sync_state, SyncState::Dirty);
+        assert_eq!(
+            completed.document.categories[0].commands[0].title,
+            "远端最终标题"
+        );
+        assert_eq!(
+            completed.document.categories[0].commands[0].description, "查看全部进程",
+            "本机独有的说明修改必须保留"
+        );
+        assert_eq!(
+            git_output(&repository, &["status", "--porcelain"]),
+            "",
+            "合并完成后工作区应保持干净"
+        );
+        assert_ne!(
+            git_output(&repository, &["rev-parse", "HEAD"]),
+            git_output(&repository, &["rev-parse", "@{u}"]),
+            "拉取合并后应保留本地提交等待主动推送"
         );
     }
 

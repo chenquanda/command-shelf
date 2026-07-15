@@ -3,9 +3,12 @@
 //! 重要约束：程序名与参数由后端决定；禁止 Shell 字符串、merge commit、破坏性 reset 和 force；
 //! 仅允许把本地数据提交接到已校验远端提交之后的受控 rebase，失败时必须自动中止并保留本地提交。
 
-use crate::command_store::parse_document_bytes;
+use crate::command_store::{parse_document_bytes, serialize_document, validate_document};
 use crate::error::AppError;
-use crate::inbox_store::parse_inbox_document_bytes;
+use crate::file_io::atomic_write;
+use crate::inbox_store::{
+    parse_inbox_document_bytes, serialize_inbox_document, validate_inbox_document,
+};
 use crate::model::{CommandDocument, InboxDocument};
 use crate::process_runner::{run_process, ProcessFailure, ProcessOutput};
 use std::fs;
@@ -76,6 +79,20 @@ pub enum RebasePreparationOutcome {
     Rebased,
     /// Git 确认受管文件存在冲突，随后成功 `rebase --abort` 并恢复原本机提交。
     Conflict(Box<RepositoryConflictSnapshot>),
+}
+
+/// 拉取准备阶段的结果；冲突分支携带语义合并所需快照而不把它压缩成错误文本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullPreparationOutcome {
+    /// 远端没有需要处理的真实冲突，拉取已按原协议完成。
+    Completed(PullOutcome),
+    /// 受管文件存在冲突，仓库已恢复干净，本地提交继续等待用户处理。
+    Conflict {
+        /// 固定共同基线、本机提交和远端提交中的两份文档。
+        snapshot: Box<RepositoryConflictSnapshot>,
+        /// 拉取开始前或自动提交后存在本地待推送提交。
+        has_local_changes: bool,
+    },
 }
 
 /// Git 业务层沿用受控进程的有限捕获结果。
@@ -660,11 +677,35 @@ pub fn pull_repository(repository: &Path) -> Result<PullOutcome, AppError> {
     pull_repository_with_after_validation(repository, || Ok(()))
 }
 
+/// 执行拉取准备阶段；无冲突时直接完成，受管文件冲突时返回已安全退出的固定快照。
+pub fn prepare_pull_repository(repository: &Path) -> Result<PullPreparationOutcome, AppError> {
+    prepare_pull_repository_with_after_validation(repository, || Ok(()))
+}
+
 /// 执行拉取核心流程；校验后回调用于确定性测试可变远端跟踪引用竞态。
 fn pull_repository_with_after_validation<F>(
     repository: &Path,
     after_validation: F,
 ) -> Result<PullOutcome, AppError>
+where
+    F: FnOnce() -> Result<(), AppError>,
+{
+    match prepare_pull_repository_with_after_validation(repository, after_validation)? {
+        PullPreparationOutcome::Completed(outcome) => Ok(outcome),
+        PullPreparationOutcome::Conflict { .. } => Err(AppError::new(
+            "GIT_DIVERGED",
+            "本地修改与远端更新存在冲突，自动同步已停止。",
+            "本地提交和数据均已保留；请在应用内确认合并结果后继续。",
+            false,
+        )),
+    }
+}
+
+/// 拉取核心流程；回调用于固定候选后推进远端引用的竞态回归。
+fn prepare_pull_repository_with_after_validation<F>(
+    repository: &Path,
+    after_validation: F,
+) -> Result<PullPreparationOutcome, AppError>
 where
     F: FnOnce() -> Result<(), AppError>,
 {
@@ -682,10 +723,10 @@ where
     let local_is_ancestor = is_ancestor(repository, "HEAD", &upstream_oid)?;
     let upstream_is_ancestor = is_ancestor(repository, &upstream_oid, "HEAD")?;
     match (local_is_ancestor, upstream_is_ancestor) {
-        (true, true) | (false, true) => Ok(PullOutcome {
+        (true, true) | (false, true) => Ok(PullPreparationOutcome::Completed(PullOutcome {
             updated: false,
             has_local_changes,
-        }),
+        })),
         (true, false) => {
             validate_commit_documents(repository, &upstream_oid)?;
             after_validation()?;
@@ -693,19 +734,28 @@ where
                 run_git(repository, &["merge", "--ff-only", &upstream_oid])?,
                 "快进本地分支",
             )?;
-            Ok(PullOutcome {
+            Ok(PullPreparationOutcome::Completed(PullOutcome {
                 updated: true,
                 has_local_changes,
-            })
+            }))
         }
         (false, false) => {
             validate_commit_documents(repository, &upstream_oid)?;
             after_validation()?;
-            rebase_onto_validated_upstream(repository, &upstream_oid)?;
-            Ok(PullOutcome {
-                updated: true,
-                has_local_changes,
-            })
+            match rebase_or_capture_conflict(repository, &upstream_oid)? {
+                RebasePreparationOutcome::Rebased => {
+                    Ok(PullPreparationOutcome::Completed(PullOutcome {
+                        updated: true,
+                        has_local_changes,
+                    }))
+                }
+                RebasePreparationOutcome::Conflict(snapshot) => {
+                    Ok(PullPreparationOutcome::Conflict {
+                        snapshot,
+                        has_local_changes,
+                    })
+                }
+            }
         }
     }
 }
@@ -929,6 +979,62 @@ fn rebase_onto_validated_upstream(repository: &Path, upstream_oid: &str) -> Resu
         "本地提交和数据均已保留；应用内冲突窗口接入后即可继续处理。",
         false,
     ))
+}
+
+/// 使用已经过用户确认的完整文档完成冲突 rebase，并创建普通的受管数据提交。
+///
+/// 参数中的提交 OID 来自冲突会话；任一引用已经变化时会拒绝套用旧决议。
+/// 副作用：重放本机提交、原子替换两份受管文档并按需创建一个本地提交；不会执行 push。
+pub fn complete_conflict_rebase(
+    repository: &Path,
+    expected_local_oid: &str,
+    expected_upstream_oid: &str,
+    commands: &CommandDocument,
+    inbox: &InboxDocument,
+) -> Result<(), AppError> {
+    ensure_empty_index(repository)?;
+    ensure_no_unrelated_changes(repository)?;
+    validate_document(commands)?;
+    validate_inbox_document(inbox)?;
+    let current_local_oid = resolve_commit_oid(repository, "HEAD", "确认冲突会话本机提交")?;
+    let current_upstream_oid = resolve_upstream_commit_oid(repository)?;
+    if current_local_oid != expected_local_oid || current_upstream_oid != expected_upstream_oid {
+        return Err(AppError::new(
+            "MERGE_SESSION_STALE",
+            "冲突窗口打开后本机或远端提交已经变化。",
+            "关闭当前窗口并重新点击拉取或推送，基于最新内容重新合并。",
+            true,
+        ));
+    }
+
+    let rebase = run_git(
+        repository,
+        &["rebase", "--strategy-option=ours", expected_upstream_oid],
+    )?;
+    if !rebase.status.success() {
+        let original = command_failure(&rebase, "应用冲突决议前重放本机提交");
+        let abort = run_git(repository, &["rebase", "--abort"])?;
+        if !abort.status.success() {
+            let cleanup = command_failure(&abort, "中止冲突决议 rebase");
+            return Err(AppError::new(
+                "GIT_FAILED",
+                format!(
+                    "{}；同时无法自动退出 rebase：{}",
+                    original.message, cleanup.message
+                ),
+                "本地提交仍然保留；请在系统终端运行 git rebase --abort 后重试。",
+                true,
+            ));
+        }
+        return Err(original);
+    }
+
+    let command_bytes = serialize_document(commands)?;
+    let inbox_bytes = serialize_inbox_document(inbox)?;
+    atomic_write(&repository.join("commands.json"), &command_bytes)?;
+    atomic_write(&repository.join("inbox.json"), &inbox_bytes)?;
+    commit_managed_documents(repository)?;
+    Ok(())
 }
 
 /// 生成不包含用户命令内容的固定自动提交消息。

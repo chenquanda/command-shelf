@@ -16,10 +16,11 @@ pub mod merge_engine;
 mod model;
 mod process_runner;
 
-use app_service::AppService;
+use app_service::{AppService, SyncConflictSession, SyncOperationResult};
 use codex_cli::{detect_codex_cli, generate_command_draft_with_retry, CodexCliStatus};
 use config_store::default_config_directory;
 use error::AppError;
+use merge_engine::MergeDecision;
 use model::{
     AppSnapshot, CommandDocument, CommandDraftGenerationResult, InboxDocument, InboxSnapshot,
 };
@@ -167,6 +168,38 @@ async fn pull_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, 
     .await
 }
 
+/// 启动支持三栏冲突窗口的拉取；无冲突直接完成，有冲突则返回固定语义合并会话。
+///
+/// 副作用：与旧拉取相同，可能提交本机受管修改并访问远端；冲突时会自动退出 rebase。
+#[tauri::command]
+async fn start_pull_repository(
+    state: State<'_, RuntimeState>,
+) -> Result<SyncOperationResult, AppError> {
+    run_blocking_app_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        |app_service| app_service.start_pull_repository(),
+    )
+    .await
+}
+
+/// 应用冲突窗口中的全部选择并完成拉取，返回仍待用户主动推送的本地快照。
+///
+/// 参数：`session` 必须来自当前仓库最近一次拉取冲突；`decisions` 必须覆盖全部待选择项。
+#[tauri::command]
+async fn complete_pull_conflict(
+    session: SyncConflictSession,
+    decisions: Vec<MergeDecision>,
+    state: State<'_, RuntimeState>,
+) -> Result<AppSnapshot, AppError> {
+    run_blocking_app_operation(
+        Arc::clone(&state.app_service),
+        Arc::clone(&state.operation_lock),
+        move |app_service| app_service.complete_pull_conflict(session, &decisions),
+    )
+    .await
+}
+
 /// 显式提交、接入远端更新并普通推送当前命令数据，成功后返回重新计算的同步状态。
 ///
 /// 副作用：可能创建或重放本地提交并访问 `origin`；不会暂存其他文件、解决冲突或使用强制推送。
@@ -214,6 +247,8 @@ pub fn run() {
             choose_repository,
             save_document,
             pull_repository,
+            start_pull_repository,
+            complete_pull_conflict,
             push_repository,
             get_codex_cli_status,
             generate_command_draft
