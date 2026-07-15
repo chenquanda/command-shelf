@@ -11,6 +11,8 @@ mod error;
 mod file_io;
 mod git_repository;
 mod inbox_store;
+/// 结构化同步冲突的纯内存三方合并接口；由 Git 编排层和对应测试共同复用。
+pub mod merge_engine;
 mod model;
 mod process_runner;
 
