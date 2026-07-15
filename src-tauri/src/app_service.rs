@@ -201,7 +201,7 @@ impl AppService {
         let inbox_path = repository.root.join("inbox.json");
         let baseline_document = load_document(&document_path)?;
         let outcome = git_pull_repository(&repository.root)?;
-        // Blob 只负责合并前校验；快进后必须重新读取工作树，以包含 EOL 转换后的真实字节哈希。
+        // Blob 只负责接入前校验；远端更新落入工作树后必须重新读取，以包含 EOL 转换后的真实字节哈希。
         let (document, document_hash) = if outcome.updated {
             load_document(&document_path)?
         } else {
@@ -228,7 +228,7 @@ impl AppService {
         Ok(snapshot)
     }
 
-    /// 保存范围校验通过后，只提交两个受管数据文件并执行普通推送。
+    /// 保存范围校验通过后，只提交两个受管数据文件，接入已校验远端更新并执行普通推送。
     ///
     /// 副作用：可能创建一个本地 Git 提交并访问 `origin`；成功推送后不再执行状态确认查询。
     pub fn push_repository(&self) -> Result<AppSnapshot, AppError> {

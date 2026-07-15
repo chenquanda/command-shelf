@@ -154,7 +154,7 @@ async fn save_document(
 
 /// 显式执行安全拉取，并在成功后返回重新校验的完整文档快照。
 ///
-/// 副作用：会访问当前仓库的 `origin`；本地有修改、候选无效或分叉时不改变工作区。
+/// 副作用：可能提交受管本地修改并访问 `origin`；候选无效时不接入远端，冲突时自动中止 rebase。
 #[tauri::command]
 async fn pull_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
     run_blocking_app_operation(
@@ -165,9 +165,9 @@ async fn pull_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, 
     .await
 }
 
-/// 显式提交并普通推送当前命令数据，成功后返回重新计算的同步状态。
+/// 显式提交、接入远端更新并普通推送当前命令数据，成功后返回重新计算的同步状态。
 ///
-/// 副作用：可能创建本地提交并访问 `origin`；不会暂存其他文件或使用强制推送。
+/// 副作用：可能创建或重放本地提交并访问 `origin`；不会暂存其他文件、解决冲突或使用强制推送。
 #[tauri::command]
 async fn push_repository(state: State<'_, RuntimeState>) -> Result<AppSnapshot, AppError> {
     run_blocking_app_operation(

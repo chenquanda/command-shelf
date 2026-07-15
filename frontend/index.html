@@ -3543,7 +3543,7 @@
     }
 
     /**
-     * 执行显式拉取或推送；桌面拉取调用 Rust 安全快进协议，浏览器预览保留短暂模拟。
+     * 执行显式拉取或推送；桌面端调用 Rust 安全同步协议，浏览器预览只保留短暂状态模拟。
      * @param {"pull"|"push"} operation 用户主动选择的同步操作。
      * @returns {Promise<void>} 操作结束或安全停止后完成。
      */
@@ -3562,8 +3562,8 @@
         syncState.operation = operation;
         syncState.error = null;
         syncState.statusMessage = operation === "pull"
-          ? "正在检查本地状态并抓取远端最新数据。"
-          : "正在校验范围、提交并普通推送两个受管数据文件。";
+          ? "正在保存本地修改并接入远端最新数据。"
+          : "正在保存本地修改、接入远端更新并普通推送。";
         renderSync();
         try {
           const snapshot = await window.__TAURI__.core.invoke(operation === "pull" ? "pull_repository" : "push_repository");
@@ -3583,12 +3583,6 @@
         return;
       }
 
-      if (operation === "pull" && syncState.hasLocalChanges) {
-        syncState.error = "请先推送本地修改，再拉取远端更新。";
-        renderSync();
-        showToastFeedback("拉取已停止，本地修改未受影响", "error", 2400);
-        return;
-      }
       if (operation === "push" && !syncState.hasLocalChanges) return;
 
       syncState.operation = operation;
@@ -3600,7 +3594,9 @@
         syncState.lastSyncedText = "刚刚";
         if (operation === "push") syncState.hasLocalChanges = false;
         renderSync();
-        showToastFeedback(operation === "pull" ? "已拉取最新数据" : "本地修改已推送");
+        showToastFeedback(operation === "pull"
+          ? (syncState.hasLocalChanges ? "已拉取，本地修改仍待推送" : "已拉取最新数据")
+          : "本地修改已推送");
       }, 900);
     }
 
