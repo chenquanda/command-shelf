@@ -1435,9 +1435,76 @@ mod tests {
         assert_eq!(restarted.document_hash.as_deref(), Some(disk_hash.as_str()));
     }
 
-    /// 验证远端领先时推送不会提交或覆盖本地未提交数据。
+    /// 验证本地命令修改与远端 Inbox 更新并存时，推送会自动接入远端并保留双方内容。
     #[test]
-    fn stops_push_before_commit_when_remote_is_ahead() {
+    fn rebases_remote_update_before_push() {
+        let directory = tempfile::tempdir().expect("应能创建测试目录");
+        let repository = cloned_repository(directory.path());
+        fs::write(
+            repository.join("commands.json"),
+            document_json("本地基线命令"),
+        )
+        .expect("应能写入本地基线");
+        commit_and_push_document(&repository, "加入本地基线");
+        let service = AppService::new(directory.path().join("config"));
+        let connected = service
+            .choose_repository(repository.to_string_lossy().as_ref())
+            .expect("连接干净仓库应成功");
+        let producer = directory.path().join("producer");
+        git(
+            directory.path(),
+            &[
+                "clone",
+                directory
+                    .path()
+                    .join("remote.git")
+                    .to_string_lossy()
+                    .as_ref(),
+                "producer",
+            ],
+        );
+        fs::write(
+            producer.join("inbox.json"),
+            serialize_inbox_document(&InboxDocument::empty()).expect("空 Inbox 应能序列化"),
+        )
+        .expect("应能写入远端 Inbox 更新");
+        commit_and_push_inbox(&producer, "制造不冲突的远端领先");
+
+        service
+            .save_document(
+                edited_document(),
+                connected
+                    .document_hash
+                    .as_deref()
+                    .expect("连接快照应有哈希"),
+            )
+            .expect("远端更新前的本地编辑应保存");
+        let pushed = service
+            .push_repository()
+            .expect("不冲突的远端更新应自动接入并推送");
+
+        assert_eq!(pushed.sync_state, SyncState::Synced);
+        assert_eq!(
+            git_output(&repository, &["rev-parse", "HEAD"]),
+            git_output(&repository, &["rev-parse", "@{u}"])
+        );
+        assert_eq!(
+            load_document(&repository.join("commands.json"))
+                .expect("推送后本地命令应有效")
+                .0,
+            edited_document()
+        );
+        assert_eq!(
+            load_inbox_document(&repository.join("inbox.json"))
+                .expect("推送后应保留远端 Inbox")
+                .0,
+            InboxDocument::empty()
+        );
+    }
+
+    /// 验证双方修改同一命令产生冲突时，推送会退出 rebase 并保留已提交的本地数据。
+    #[test]
+    fn aborts_push_rebase_conflict_and_preserves_local_commit() {
         let directory = tempfile::tempdir().expect("应能创建测试目录");
         let repository = cloned_repository(directory.path());
         fs::write(
@@ -1482,17 +1549,22 @@ mod tests {
         let before_head = git_output(&repository, &["rev-parse", "HEAD"]);
         let error = service
             .push_repository()
-            .expect_err("远端领先时普通推送必须停止");
+            .expect_err("同一内容冲突时推送必须安全停止");
 
-        assert_eq!(error.code, "REMOTE_AHEAD");
-        assert_eq!(git_output(&repository, &["rev-parse", "HEAD"]), before_head);
-        assert!(
-            git_output(
-                &repository,
-                &["status", "--porcelain", "--", "commands.json"]
-            )
-            .contains("commands.json"),
-            "本地数据修改应继续保留"
+        assert_eq!(error.code, "GIT_DIVERGED");
+        assert_ne!(git_output(&repository, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(
+            git_output(&repository, &["status", "--porcelain"]),
+            "",
+            "自动中止后不应残留冲突或工作区修改"
+        );
+        assert!(!repository.join(".git").join("rebase-merge").exists());
+        assert!(!repository.join(".git").join("rebase-apply").exists());
+        assert_eq!(
+            load_document(&repository.join("commands.json"))
+                .expect("冲突停止后本地命令应保持有效")
+                .0,
+            edited_document()
         );
     }
 

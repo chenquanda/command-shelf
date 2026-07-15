@@ -1,6 +1,7 @@
-//! 文件职责：验证专用数据仓库、读取受管数据状态并执行安全快进拉取与普通推送。
+//! 文件职责：验证专用数据仓库、读取受管数据状态并执行安全拉取与普通推送。
 //! 主要内容：固定调用受控 Git 子命令，提供非交互、无窗口、限时和有限输出的进程边界。
-//! 重要约束：程序名与参数由后端决定；禁止 Shell 字符串、merge commit、rebase、reset 和 force。
+//! 重要约束：程序名与参数由后端决定；禁止 Shell 字符串、merge commit、破坏性 reset 和 force；
+//! 仅允许把本地数据提交接到已校验远端提交之后的受控 rebase，失败时必须自动中止并保留本地提交。
 
 use crate::command_store::parse_document_bytes;
 use crate::error::AppError;
@@ -122,6 +123,9 @@ fn run_git_process(
     const GIT_ENVIRONMENT: &[(&str, &str)] = &[
         ("GIT_TERMINAL_PROMPT", "0"),
         ("GCM_INTERACTIVE", "Never"),
+        // rebase 不得因为提交信息编辑器占住后台线程；应用只重放既有提交，不改写提交说明。
+        ("GIT_EDITOR", "true"),
+        ("GIT_SEQUENCE_EDITOR", "true"),
         // Git for Windows 尊重该 locale；固定英文诊断后结构化分类不依赖用户系统语言。
         ("LC_ALL", "C"),
         ("LANG", "C"),
@@ -672,6 +676,63 @@ fn rollback_staging_after_commit_failure(repository: &Path, original: AppError) 
     }
 }
 
+/// 只暂存并提交两个受管数据文件；没有文件差异时不创建空提交。
+///
+/// 返回值表示本次调用是否创建了提交。提交失败时会撤销应用创建的暂存，但绝不回退工作区数据。
+fn commit_managed_documents(repository: &Path) -> Result<bool, AppError> {
+    let managed_files = managed_data_files(repository)?;
+    let mut add_arguments = vec!["add", "--"];
+    add_arguments.extend(managed_files.iter().copied());
+    require_success(run_git(repository, &add_arguments)?, "暂存受管数据")?;
+    if !staged_documents_changed(repository)? {
+        return Ok(false);
+    }
+
+    let commit_result = (|| -> Result<(), AppError> {
+        let message = sync_commit_message()?;
+        let mut commit_arguments = vec!["commit", "-m", message.as_str(), "--"];
+        commit_arguments.extend(managed_files.iter().copied());
+        require_success(run_git(repository, &commit_arguments)?, "提交受管数据")?;
+        Ok(())
+    })();
+    if let Err(error) = commit_result {
+        return Err(rollback_staging_after_commit_failure(repository, error));
+    }
+    Ok(true)
+}
+
+/// 把本地提交重放到固定且已校验的远端提交；冲突时中止 rebase 并恢复本地提交。
+///
+/// 该函数不解决冲突，也不使用强制或破坏性命令。若 Git 无法完成自动中止，会返回更高优先级的人工恢复提示。
+fn rebase_onto_validated_upstream(repository: &Path, upstream_oid: &str) -> Result<(), AppError> {
+    let output = run_git(repository, &["rebase", upstream_oid])?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let original = command_failure(&output, "接入远端更新");
+    let abort = run_git(repository, &["rebase", "--abort"])?;
+    if !abort.status.success() {
+        let cleanup = command_failure(&abort, "中止远端更新");
+        return Err(AppError::new(
+            "GIT_FAILED",
+            format!(
+                "{}；同时无法自动退出 rebase：{}",
+                original.message, cleanup.message
+            ),
+            "本地提交仍在仓库中；请在系统终端运行 git rebase --abort 后重试。",
+            true,
+        ));
+    }
+
+    Err(AppError::new(
+        "GIT_DIVERGED",
+        "本地修改与远端更新存在冲突，自动同步已停止。",
+        "本地提交和数据均已保留；请在系统终端处理冲突后重试。",
+        false,
+    ))
+}
+
 /// 生成不包含用户命令内容的固定自动提交消息。
 fn sync_commit_message() -> Result<String, AppError> {
     let seconds = SystemTime::now()
@@ -688,62 +749,30 @@ fn sync_commit_message() -> Result<String, AppError> {
     Ok(format!("chore(data): sync CommandShelf data {seconds}"))
 }
 
-/// 执行显式安全推送：只提交数据文件，预检远端关系，并且永不强制覆盖。
+/// 执行显式安全推送：只提交数据文件，接入已校验远端更新，并且永不强制覆盖。
 pub fn push_repository(repository: &Path) -> Result<PushOutcome, AppError> {
     ensure_empty_index(repository)?;
     ensure_no_unrelated_changes(repository)?;
+    let ahead_before_commit = local_ahead_count(repository)?;
+    let committed = commit_managed_documents(repository)?;
+    if !committed && ahead_before_commit == 0 {
+        return Ok(PushOutcome {
+            committed: false,
+            pushed: false,
+        });
+    }
+
     require_success(
         run_git(repository, &["fetch", "--prune", "origin"])?,
         "检查远端最新状态",
     )?;
 
-    let upstream_is_ancestor = is_ancestor(repository, "@{u}", "HEAD")?;
+    let upstream_oid = resolve_upstream_commit_oid(repository)?;
+    let upstream_is_ancestor = is_ancestor(repository, &upstream_oid, "HEAD")?;
     if !upstream_is_ancestor {
-        if is_ancestor(repository, "HEAD", "@{u}")? {
-            return Err(AppError::new(
-                "REMOTE_AHEAD",
-                "远端包含本地尚未拉取的提交，推送已停止。",
-                "保留当前本地修改，在系统终端处理远端更新后再重试。",
-                false,
-            ));
-        }
-        return Err(AppError::new(
-            "GIT_DIVERGED",
-            "本地分支与远端已经分叉，应用不会自动合并或强制推送。",
-            "在系统终端处理分叉后重新打开应用。",
-            false,
-        ));
+        validate_commit_documents(repository, &upstream_oid)?;
+        rebase_onto_validated_upstream(repository, &upstream_oid)?;
     }
-    // 所有 Git 状态查询都必须在本次可能创建提交之前完成，避免提交后查询失败被误报为无副作用失败。
-    let ahead_before_commit = local_ahead_count(repository)?;
-    let managed_files = managed_data_files(repository)?;
-
-    let mut add_arguments = vec!["add", "--"];
-    add_arguments.extend(managed_files.iter().copied());
-    require_success(run_git(repository, &add_arguments)?, "暂存受管数据")?;
-    let committed = if staged_documents_changed(repository)? {
-        let commit_result = (|| -> Result<(), AppError> {
-            let message = sync_commit_message()?;
-            let mut commit_arguments = vec!["commit", "-m", message.as_str(), "--"];
-            commit_arguments.extend(managed_files.iter().copied());
-            require_success(run_git(repository, &commit_arguments)?, "提交受管数据")?;
-            Ok(())
-        })();
-        if let Err(error) = commit_result {
-            return Err(rollback_staging_after_commit_failure(repository, error));
-        }
-        true
-    } else {
-        false
-    };
-
-    if !committed && ahead_before_commit == 0 {
-        return Ok(PushOutcome {
-            committed,
-            pushed: false,
-        });
-    }
-
     require_success(run_git(repository, &["push"])?, "推送受管数据")?;
     // `git push` 的零退出码就是远端接受提交的提交点；其后不再运行可能失败的状态确认。
     Ok(PushOutcome {
