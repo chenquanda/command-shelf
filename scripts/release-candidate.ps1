@@ -298,6 +298,7 @@ $tauriConfigPath = Join-Path $repositoryRoot "src-tauri\tauri.conf.json"
 $frontendPath = Join-Path $repositoryRoot "frontend\index.html"
 $desktopSmokePath = Join-Path $repositoryRoot "scripts\desktop-smoke.mjs"
 $copyRefreshRegressionPath = Join-Path $repositoryRoot "scripts\复制无刷新回归.mjs"
+$syncConflictRegressionPath = Join-Path $repositoryRoot "scripts\同步冲突界面回归.mjs"
 $targetTriple = "x86_64-pc-windows-msvc"
 $previousCargoTargetDirectory = $env:CARGO_TARGET_DIR
 $previousTempDirectory = $env:TEMP
@@ -327,6 +328,7 @@ try {
     Invoke-CheckedCommand -Label "Rust Clippy 零警告检查" -FilePath "cargo" -Arguments @("clippy", "--manifest-path", $manifestPath, "--all-targets", "--", "-D", "warnings")
     Invoke-CheckedCommand -Label "桌面验收脚本语法检查" -FilePath "node" -Arguments @("--check", $desktopSmokePath)
     Invoke-CheckedCommand -Label "复制无刷新回归" -FilePath "node" -Arguments @($copyRefreshRegressionPath)
+    Invoke-CheckedCommand -Label "同步冲突界面回归" -FilePath "node" -Arguments @($syncConflictRegressionPath)
 
     # 直接编译 HTML 中每个非外链脚本；不执行页面代码，也不需要额外前端工具链。
     $inlineScriptCheck = @'
@@ -390,6 +392,7 @@ scripts.forEach((match, index) => {
             "cargo clippy --all-targets -- -D warnings",
             "desktop-smoke.mjs 语法",
             "复制无刷新回归",
+            "同步冲突界面回归",
             "frontend/index.html 内联脚本语法",
             "cargo tauri build --bundles nsis",
             "Git 工作树干净且构建前后 HEAD 一致"
