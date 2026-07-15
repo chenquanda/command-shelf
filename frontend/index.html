@@ -3410,6 +3410,61 @@
       return decision.customValue;
     }
 
+    /**
+     * 把当前已完成的字段选择应用到候选文档副本，仅用于“完整 JSON”即时预览。
+     * 后端仍会按固定三方会话重新校验并生成权威结果，前端预览不能替代持久化校验。
+     * @param {object} plan 当前 commands.json 或 inbox.json 合并计划。
+     * @returns {object} 包含自动结果和当前人工选择的独立文档副本。
+     */
+    function buildMergePreviewDocument(plan) {
+      const document = structuredClone(plan.mergedDocument);
+      const findCommandLocation = (commandId) => {
+        for (const category of document.categories || []) {
+          const index = (category.commands || []).findIndex((command) => command.id === commandId);
+          if (index >= 0) return { category, index };
+        }
+        return null;
+      };
+
+      for (const record of plan.records) {
+        for (const field of record.fields) {
+          if (field.status !== "conflict") continue;
+          const decision = mergeState.decisions.get(field.resolutionId);
+          if (!decision) continue;
+          const value = resolveMergeResultValue(field);
+
+          if (record.entityKind === "inbox") {
+            const index = document.items.findIndex((item) => item.id === record.entityId);
+            if (field.key === "record") {
+              if (value === null && index >= 0) document.items.splice(index, 1);
+              else if (value !== null && index >= 0) document.items[index] = structuredClone(value);
+              else if (value !== null) document.items.unshift(structuredClone(value));
+            } else if (index >= 0) document.items[index][field.key] = structuredClone(value);
+            continue;
+          }
+
+          if (record.entityKind === "category") {
+            const index = document.categories.findIndex((category) => category.id === record.entityId);
+            if (field.key === "record") {
+              if (value === null && index >= 0) document.categories.splice(index, 1);
+              else if (value !== null && index >= 0) document.categories[index] = structuredClone(value);
+              else if (value !== null) document.categories.push(structuredClone(value));
+            } else if (index >= 0) document.categories[index][field.key] = structuredClone(value);
+            continue;
+          }
+
+          const location = findCommandLocation(record.entityId);
+          if (field.key === "record") {
+            if (value === null && location) location.category.commands.splice(location.index, 1);
+            else if (value !== null && location) location.category.commands[location.index] = structuredClone(value);
+          } else if (location) {
+            location.category.commands[location.index][field.key] = structuredClone(value);
+          }
+        }
+      }
+      return document;
+    }
+
     /** 根据后端状态和当前选择生成中间栏短说明。 */
     function mergeResultExplanation(field) {
       const decision = mergeState.decisions.get(field.resolutionId);
@@ -3504,7 +3559,7 @@
         }).join("")
         : `<span class="merge-record-nav-button">此文件没有差异</span>`;
       mergeRecords.innerHTML = plan.records.map(renderMergeRecord).join("");
-      mergeFullJson.textContent = JSON.stringify(plan.mergedDocument, null, 2);
+      mergeFullJson.textContent = JSON.stringify(buildMergePreviewDocument(plan), null, 2);
       const showJson = mergeState.view === "json";
       mergeColumnHeadings.hidden = showJson;
       mergeRecords.hidden = showJson;
@@ -3543,6 +3598,67 @@
       mergeState.decisions.clear();
       mergeState.error = "";
       restoreFocus([returnFocus, pullButton, pushButton, repositoryButton]);
+    }
+
+    /** 用户主动放弃当前冲突处理；固定会话已在后端退出 rebase，本地数据保持安全可用。 */
+    function cancelMergeDialog() {
+      if (mergeState.completing) return;
+      const operation = mergeState.session?.operation;
+      closeMergeDialog();
+      syncState.operation = null;
+      syncState.error = null;
+      syncState.statusMessage = `${operation === "push" ? "推送" : "拉取"}冲突尚未处理，本机数据未改变。`;
+      renderSync();
+    }
+
+    /**
+     * 把全部人工选择和固定会话交回 Rust 后端，并在成功后接入权威快照。
+     * 失败时保留窗口、选择与滚动上下文，用户可以修正或直接重试。
+     * @returns {Promise<void>} 后端完成合并、继续同步或明确报错后结束。
+     */
+    async function completeMergeConflict() {
+      if (!mergeState.session || mergeState.completing || mergeCompleteButton.disabled) return;
+      if (!isDesktopRuntime) {
+        closeMergeDialog();
+        showToastFeedback("模拟冲突合并已完成");
+        return;
+      }
+
+      const session = structuredClone(mergeState.session);
+      const decisions = Array.from(mergeState.decisions.values()).map((decision) => structuredClone(decision));
+      const operation = session.operation;
+      mergeState.completing = true;
+      mergeState.error = "";
+      syncState.operation = operation;
+      syncState.error = null;
+      syncState.statusMessage = operation === "push"
+        ? "正在写入合并结果并继续普通推送。"
+        : "正在写入合并结果并完成本次拉取。";
+      renderMergeDialog();
+      renderSync();
+
+      try {
+        const snapshot = await window.__TAURI__.core.invoke(
+          operation === "push" ? "complete_push_conflict" : "complete_pull_conflict",
+          { session, decisions }
+        );
+        applyDesktopSnapshot(snapshot, { preserveView: true });
+        if (operation === "pull") {
+          resetInboxState();
+          if (inboxViewActive) await loadInboxDocument({ force: true });
+        }
+        const successMessage = snapshot.statusMessage;
+        closeMergeDialog();
+        showToastFeedback(successMessage);
+      } catch (error) {
+        syncState.operation = null;
+        syncState.statusMessage = "合并未写入，当前选择仍保留在窗口中。";
+        mergeState.completing = false;
+        mergeState.error = [error?.message, error?.action].filter(Boolean).join(" ") || "无法完成冲突合并，请检查选择后重试。";
+        renderSync();
+        renderMergeDialog();
+        mergeCompleteButton.focus({ preventScroll: true });
+      }
     }
 
     /** 记录一项本机、远端或自定义选择，并立即只重绘冲突窗口。 */
@@ -4201,7 +4317,18 @@
           : "正在保存本地修改、接入远端更新并普通推送。";
         renderSync();
         try {
-          const snapshot = await window.__TAURI__.core.invoke(operation === "pull" ? "pull_repository" : "push_repository");
+          const result = await window.__TAURI__.core.invoke(operation === "pull" ? "start_pull_repository" : "start_push_repository");
+          if (result.status === "conflict") {
+            syncState.operation = null;
+            syncState.statusMessage = `发现 ${result.session.conflictCount} 项内容冲突，请在窗口中确认最终结果。`;
+            renderSync();
+            openMergeDialog(result.session, operation === "pull" ? pullButton : pushButton);
+            return;
+          }
+          if (result.status !== "completed" || !result.snapshot) {
+            throw new Error("同步后端返回了无法识别的结果。");
+          }
+          const snapshot = result.snapshot;
           applyDesktopSnapshot(snapshot, { preserveView: true });
           if (operation === "pull") {
             resetInboxState();
@@ -5398,13 +5525,9 @@
       mergeState.view = mergeState.view === "json" ? "diff" : "json";
       renderMergeDialog();
     });
-    document.getElementById("merge-cancel-button").addEventListener("click", closeMergeDialog);
-    document.getElementById("merge-dialog-dismiss").addEventListener("click", closeMergeDialog);
-    mergeCompleteButton.addEventListener("click", () => {
-      if (mergeCompleteButton.disabled || isDesktopRuntime) return;
-      closeMergeDialog();
-      showToastFeedback("模拟冲突合并已完成");
-    });
+    document.getElementById("merge-cancel-button").addEventListener("click", cancelMergeDialog);
+    document.getElementById("merge-dialog-dismiss").addEventListener("click", cancelMergeDialog);
+    mergeCompleteButton.addEventListener("click", () => { void completeMergeConflict(); });
 
     /**
      * 添加分类使用原生轻量输入，避免引入不必要的二级管理界面。
@@ -5755,11 +5878,20 @@
     });
 
     /**
-     * 统一管理最上层浮层的 Escape 与 Tab：Codex、仓库对话框依次优先于命令抽屉。
+     * 统一管理最上层浮层的 Escape 与 Tab：同步冲突、Codex、仓库对话框依次优先于命令抽屉。
      * @param {KeyboardEvent} event 页面级键盘事件。
      * @returns {void}
      */
     document.addEventListener("keydown", (event) => {
+      if (mergeDialogLayer.classList.contains("is-open")) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          cancelMergeDialog();
+        } else {
+          trapDialogFocus(event, mergeDialog);
+        }
+        return;
+      }
       if (codexDialogLayer.classList.contains("is-open")) {
         if (event.key === "Escape") {
           event.preventDefault();

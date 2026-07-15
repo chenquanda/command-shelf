@@ -215,16 +215,19 @@ function createTauriStub() {
           window.__activeSaveCalls -= 1;
         }
       }
-      if (command === "push_repository") {
+      if (command === "start_push_repository") {
         window.__pushDuringSave = window.__activeSaveCalls > 0;
         window.__operationOrder.push("push:start");
         return {
-          document: structuredClone(window.__savedDocument),
-          repositoryPath: "F:\\\\isolated-command-shelf-data",
-          syncState: "synced",
-          statusMessage: "测试推送已完成。",
-          documentHash: "hash-after-save-" + window.__savedRevision,
-          error: null
+          status: "completed",
+          snapshot: {
+            document: structuredClone(window.__savedDocument),
+            repositoryPath: "F:\\\\isolated-command-shelf-data",
+            syncState: "synced",
+            statusMessage: "测试推送已完成。",
+            documentHash: "hash-after-save-" + window.__savedRevision,
+            error: null
+          }
         };
       }
       throw new Error("测试替身不支持命令：" + command);

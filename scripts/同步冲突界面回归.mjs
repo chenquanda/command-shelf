@@ -46,6 +46,13 @@ const requiredFragments = [
   '本机删除了此命令，远端修改了内容',
   '已按共同基线自动累计：10 + 3 + 5',
   '两边修改结果不同，请选择或编辑最终内容',
+  '"start_pull_repository"',
+  '"start_push_repository"',
+  '"complete_pull_conflict"',
+  '"complete_push_conflict"',
+  'trapDialogFocus(event, mergeDialog)',
+  'mergeState.error = [error?.message, error?.action]',
+  'buildMergePreviewDocument(plan)',
 ];
 
 for (const fragment of requiredFragments) {
